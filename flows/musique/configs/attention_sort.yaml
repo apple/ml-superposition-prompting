@@ -1,0 +1,21 @@
+parameters:
+  #checkpoint_path: "bigscience/bigscience-small-testing"
+  checkpoint_path: "mosaicml/mpt-7b-instruct"
+  data_dir: "flows/musique/data/musique_ans_v1.0_dev.jsonl"
+  output_dir: "/mnt/task_wrapper/user_output/artifacts/"
+  branch_weighting_fn: None
+  max_new_tokens: 100
+  superposition_hops: 0
+  superposition_flattening: 20
+  generate_temperature: 0.0
+
+# Other options:
+# pre_filter_fn:
+# - "partial(attention_sort, attention_sort_steps=1)"
+# - "partial(attention_sort, attention_sort_steps=2)"
+# - "partial(attention_sort, attention_sort_steps=3)"
+# checkpoint_path:
+# - 'bigscience/bloomz-1b7'
+# - 'bigscience/bloomz-3b'
+# - 'bigscience/bloomz-7b1'
+# - 'mosaicml/mpt-7b-instruct'

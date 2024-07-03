@@ -1,0 +1,50 @@
+[tool.poetry]
+name = "superposition-prompting"
+version = "0.1.0"
+description = ""
+authors = ["Thomas Merth <tmerth@apple.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+ruff = ">=0.4.0"
+python = ">=3.9.0,<4"
+charset-normalizer = "^3.1.0"  # Needed cause of a bug in poetry
+urllib3 = "^1.26.16"  # Needed cause of a bug in poetry
+sentencepiece = "^0.1.99"
+pyvis = "^0.3.2"
+plotly = "^5.18.0"
+humanize = "^4.9.0"
+xopen = "^1.8.0"
+scipy = "^1.11.4"
+networkx = "^3.2.1"
+traitlets = "^5.14.0"
+pytest = "^7.4.3"
+matplotlib = "^3.8.2"
+einops = "^0.7.0"
+scikit-learn = "^1.4.2"
+rank-bm25 = "^0.2.2"
+pydantic = "^2.7.1"
+torch = "^2.3.0"
+parameterized = "^0.9.0"
+datasets = "^2.19.1"
+
+[tool.black]
+line-length = 120
+
+[tool.poetry.scripts]
+lost_in_the_middle = "flows.lost_in_the_middle.main:main"
+musique = "flows.musique.main:main"
+
+include = '\.pyi?$'
+
+exclude = '''
+(
+      __pycache__
+    | \.git
+    | \.mypy_cache
+    | \.pytest_cache
+    | \.vscode
+    | \.venv
+    | \__init__.py*
+)
+'''

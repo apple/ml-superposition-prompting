@@ -1,0 +1,25 @@
+parameters:
+  input_path: flows/lost_in_the_middle/data/nq-open-20_total_documents_gold_at_0.jsonl.gz
+  output_responses_path: artifacts/nq-open-20_total_documents_gold_at_0-predictions.jsonl.gz
+  output_score_path: artifacts/nq-open-20_total_documents_gold_at_0-predictions-scored.jsonl.gz
+  max_new_tokens: 100
+  superposition: True
+  forkjoin_temperature: 0.01
+  superposition_flattening: 1
+  forkjoin_topk: 1
+  attenuate_fn: 'bayesian_attenuate_forkjoin_branches'
+  pre_filter_fn: "None"
+  model_name: 'bigscience/bloomz-1b7'
+  forkjoin_position_fn: equilibrium_from_forkjoin_digraphs
+  use_random_ordering: True
+  use_random_ordering_fix_gold: False
+
+# Other options:
+# model_name:
+# - 'bigscience/bloomz-1b7'
+# - 'bigscience/bloomz-3b'
+# - 'bigscience/bloomz-7b1'
+# - 'mosaicml/mpt-7b-instruct'
+# superposition_flattening:
+# - 1
+# - 20

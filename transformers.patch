@@ -1,0 +1,3116 @@
+From 810324301c277445f5b61b3880169179b8c60f81 Mon Sep 17 00:00:00 2001
+From: Thomas Merth <thomasmerth@Thomass-Laptop.local>
+Date: Thu, 23 May 2024 12:05:40 -0700
+Subject: [PATCH] Superposition prompting implementation
+
+---
+ src/transformers/__init__.py                  |   6 +
+ src/transformers/generation/utils.py          |   8 +
+ src/transformers/modeling_outputs.py          |   8 +
+ src/transformers/modeling_utils.py            |   8 +
+ .../models/bloom/modeling_bloom.py            | 107 ++-
+ .../models/llama/modeling_llama.py            | 172 +++--
+ src/transformers/models/mpt/modeling_mpt.py   | 116 +++-
+ src/transformers/prompting/__init__.py        |   0
+ .../prompting/superposition/__init__.py       |   2 +
+ .../prompting/superposition/core.py           | 546 +++++++++++++++
+ .../prompting/superposition/forkjoin.py       | 574 +++++++++++++++
+ src/transformers/testing_utils.py             |   2 +-
+ src/transformers/utils/import_utils.py        |   2 +-
+ tests/models/bloom/test_modeling_bloom.py     |  62 +-
+ tests/models/llama/test_modeling_llama.py     |  55 +-
+ tests/models/mpt/test_modeling_mpt.py         |  47 +-
+ tests/prompting/__init__.py                   |   0
+ tests/prompting/superposition/__init__.py     |   0
+ .../test_superposition_prompt.py              | 654 ++++++++++++++++++
+ tests/test_modeling_common.py                 |  48 ++
+ 20 files changed, 2305 insertions(+), 112 deletions(-)
+ create mode 100644 src/transformers/prompting/__init__.py
+ create mode 100644 src/transformers/prompting/superposition/__init__.py
+ create mode 100644 src/transformers/prompting/superposition/core.py
+ create mode 100644 src/transformers/prompting/superposition/forkjoin.py
+ create mode 100644 tests/prompting/__init__.py
+ create mode 100644 tests/prompting/superposition/__init__.py
+ create mode 100644 tests/prompting/superposition/test_superposition_prompt.py
+
+diff --git a/src/transformers/__init__.py b/src/transformers/__init__.py
+index 3b03c606b..d12207224 100644
+--- a/src/transformers/__init__.py
++++ b/src/transformers/__init__.py
+@@ -973,6 +973,10 @@ _import_structure = {
+         "pipeline",
+     ],
+     "processing_utils": ["ProcessorMixin"],
++    "prompting": [],
++    "prompting.superposition": [],
++    "prompting.superposition.core": [""],
++    "prompting.superposition.forkjoin": ["ForkjoinInputIds"],
+     "testing_utils": [],
+     "tokenization_utils": ["PreTrainedTokenizer"],
+     "tokenization_utils_base": [
+@@ -3623,6 +3627,8 @@ else:
+     ]
+     _import_structure["sagemaker"] = []
+     _import_structure["time_series_utils"] = []
++    _import_structure["superposition_prompt"] = []
++
+     _import_structure["trainer"] = ["Trainer"]
+     _import_structure["trainer_pt_utils"] = ["torch_distributed_zero_first"]
+     _import_structure["trainer_seq2seq"] = ["Seq2SeqTrainer"]
+diff --git a/src/transformers/generation/utils.py b/src/transformers/generation/utils.py
+index d7510951b..aa4609847 100644
+--- a/src/transformers/generation/utils.py
++++ b/src/transformers/generation/utils.py
+@@ -1964,6 +1964,14 @@ class GenerationMixin:
+                 **model_kwargs,
+             )
+ 
++    def superposition_prompt_generate(self, superposition_prompt, **kwargs) -> Union[GenerateOutput, torch.LongTensor]:
++        return self.generate(
++            input_ids=superposition_prompt.input_ids,
++            position_ids=superposition_prompt.position_ids,
++            attention_logit_biases=superposition_prompt.attention_logit_biases,
++            **kwargs,
++        )
++
+     @torch.no_grad()
+     def contrastive_search(
+         self,
+diff --git a/src/transformers/modeling_outputs.py b/src/transformers/modeling_outputs.py
+index cbee6a292..fe6180993 100755
+--- a/src/transformers/modeling_outputs.py
++++ b/src/transformers/modeling_outputs.py
+@@ -287,6 +287,14 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
+     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+ 
+ 
++import enum
++
++
++class AttentionReduction(enum.Enum):
++    NONE = 0
++    LAYER_AND_HEAD = 1
++
++
+ @dataclass
+ class MoECausalLMOutputWithPast(ModelOutput):
+     """
+diff --git a/src/transformers/modeling_utils.py b/src/transformers/modeling_utils.py
+index 3247c3236..c47001dbb 100644
+--- a/src/transformers/modeling_utils.py
++++ b/src/transformers/modeling_utils.py
+@@ -1102,6 +1102,14 @@ class ModuleUtilsMixin:
+ 
+         return 6 * self.estimate_tokens(input_dict) * self.num_parameters(exclude_embeddings=exclude_embeddings)
+ 
++    def superposition_forward(self, superposition_prompt, **kwargs) -> Any:
++        return self(
++            input_ids=superposition_prompt.input_ids,
++            position_ids=superposition_prompt.position_ids,
++            attention_logit_biases=superposition_prompt.attention_logit_biases,
++            **kwargs,
++        )
++
+ 
+ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMixin, PeftAdapterMixin):
+     r"""
+diff --git a/src/transformers/models/bloom/modeling_bloom.py b/src/transformers/models/bloom/modeling_bloom.py
+index ad1e87ec2..64686961c 100644
+--- a/src/transformers/models/bloom/modeling_bloom.py
++++ b/src/transformers/models/bloom/modeling_bloom.py
+@@ -27,6 +27,7 @@ from torch.nn import functional as F
+ from ...file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
+ from ...modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+ from ...modeling_outputs import (
++    AttentionReduction,
+     BaseModelOutputWithPastAndCrossAttentions,
+     CausalLMOutputWithCrossAttentions,
+     QuestionAnsweringModelOutput,
+@@ -54,7 +55,9 @@ BLOOM_PRETRAINED_MODEL_ARCHIVE_LIST = [
+ ]
+ 
+ 
+-def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
++def build_alibi_tensor(
++    attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype, position_ids: Optional[torch.Tensor] = None
++) -> torch.Tensor:
+     """
+     Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
+     relies on a translation invariance of softmax for quick implementation: with l being a tensor, and a fixed value
+@@ -72,6 +75,13 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torc
+             dtype of the output tensor
+     """
+     batch_size, seq_length = attention_mask.shape
++    if position_ids is None:
++        position_ids = (attention_mask.cumsum(dim=-1) - 1) * attention_mask
++    else:
++        assert position_ids.ndim == 2
++        position_ids = position_ids.to(attention_mask.device)
++    position_ids = position_ids[:, None, :]
++
+     closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+     base = torch.tensor(
+         2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+@@ -93,8 +103,8 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torc
+     # => the query_length dimension will then be broadcasted correctly
+     # This is more or less identical to T5's relative position bias:
+     # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+-    arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
+-    alibi = slopes[..., None] * arange_tensor
++
++    alibi = slopes[..., None] * position_ids
+     return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
+ 
+ 
+@@ -253,10 +263,11 @@ class BloomAttention(nn.Module):
+         residual: torch.Tensor,
+         alibi: torch.Tensor,
+         attention_mask: torch.Tensor,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+         head_mask: Optional[torch.Tensor] = None,
+         use_cache: bool = False,
+-        output_attentions: bool = False,
++        output_attentions: Union[bool, AttentionReduction] = False,
+     ):
+         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+ 
+@@ -301,6 +312,11 @@ class BloomAttention(nn.Module):
+         if input_dtype == torch.float16:
+             attention_scores = attention_scores.to(torch.float)
+         attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
++        if attention_logit_biases is not None:
++            attention_logit_biases_safe = attention_logit_biases.clip(
++                torch.finfo(attention_scores.dtype).min, torch.finfo(attention_scores.dtype).max
++            ).to(attention_scores.dtype)
++            attn_weights += attention_logit_biases_safe
+         attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
+ 
+         # [batch_size, num_heads, q_length, kv_length]
+@@ -333,7 +349,9 @@ class BloomAttention(nn.Module):
+         output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
+ 
+         outputs = (output_tensor, present)
+-        if output_attentions:
++        if output_attentions == AttentionReduction.LAYER_AND_HEAD:
++            attention_probs = attention_probs.mean(dim=1)
++        if output_attentions not in [False, None]:
+             outputs += (attention_probs,)
+ 
+         return outputs
+@@ -390,6 +408,7 @@ class BloomBlock(nn.Module):
+         hidden_states: torch.Tensor,
+         alibi: torch.Tensor,
+         attention_mask: torch.Tensor,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+         head_mask: Optional[torch.Tensor] = None,
+         use_cache: bool = False,
+@@ -410,6 +429,7 @@ class BloomBlock(nn.Module):
+         attn_outputs = self.self_attention(
+             layernorm_output,
+             residual,
++            attention_logit_biases=attention_logit_biases,
+             layer_past=layer_past,
+             attention_mask=attention_mask,
+             alibi=alibi,
+@@ -603,8 +623,14 @@ class BloomModel(BloomPreTrainedModel):
+         # Initialize weights and apply final processing
+         self.post_init()
+ 
+-    def build_alibi_tensor(self, attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
+-        return build_alibi_tensor(attention_mask, num_heads, dtype)
++    def build_alibi_tensor(
++        self,
++        attention_mask: torch.Tensor,
++        num_heads: int,
++        dtype: torch.dtype,
++        position_ids: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        return build_alibi_tensor(attention_mask, num_heads, dtype, position_ids=position_ids)
+ 
+     def get_input_embeddings(self):
+         return self.word_embeddings
+@@ -621,8 +647,10 @@ class BloomModel(BloomPreTrainedModel):
+     def forward(
+         self,
+         input_ids: Optional[torch.LongTensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
+         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         head_mask: Optional[torch.LongTensor] = None,
+         inputs_embeds: Optional[torch.LongTensor] = None,
+         use_cache: Optional[bool] = None,
+@@ -631,13 +659,6 @@ class BloomModel(BloomPreTrainedModel):
+         return_dict: Optional[bool] = None,
+         **deprecated_arguments,
+     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
+-        if deprecated_arguments.pop("position_ids", False) is not False:
+-            # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
+-            warnings.warn(
+-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
+-                " passing `position_ids`.",
+-                FutureWarning,
+-            )
+         if len(deprecated_arguments) > 0:
+             raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
+ 
+@@ -693,7 +714,17 @@ class BloomModel(BloomPreTrainedModel):
+         else:
+             attention_mask = attention_mask.to(hidden_states.device)
+ 
+-        alibi = self.build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
++        if attention_logit_biases is not None:
++            end_idx = past_key_values_length + seq_length
++            attention_logit_biases = attention_logit_biases.to(hidden_states.device)[
++                :, None, past_key_values_length:end_idx, :seq_length_with_past
++            ]
++        if position_ids is not None:
++            position_ids = position_ids[:, :seq_length_with_past]
++
++        alibi = self.build_alibi_tensor(
++            attention_mask, self.num_heads, dtype=hidden_states.dtype, position_ids=position_ids
++        )
+ 
+         causal_mask = _prepare_4d_causal_attention_mask(
+             attention_mask,
+@@ -723,6 +754,7 @@ class BloomModel(BloomPreTrainedModel):
+                     hidden_states,
+                     layer_past=layer_past,
+                     attention_mask=causal_mask,
++                    attention_logit_biases=attention_logit_biases,
+                     head_mask=head_mask[i],
+                     use_cache=use_cache,
+                     output_attentions=output_attentions,
+@@ -780,8 +812,10 @@ class BloomForCausalLM(BloomPreTrainedModel):
+     def prepare_inputs_for_generation(
+         self,
+         input_ids: torch.LongTensor,
++        position_ids: Optional[torch.LongTensor] = None,
+         past_key_values: Optional[torch.Tensor] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         inputs_embeds: Optional[torch.Tensor] = None,
+         **kwargs,
+     ) -> dict:
+@@ -789,6 +823,8 @@ class BloomForCausalLM(BloomPreTrainedModel):
+         if past_key_values is not None:
+             past_length = past_key_values[0][0].shape[2]
+ 
++            seq_length = input_ids.shape[-1]
++            assert seq_length - past_length >= 1
+             # Some generation methods already pass only the last input ID
+             if input_ids.shape[1] > past_length:
+                 remove_prefix_length = past_length
+@@ -811,8 +847,10 @@ class BloomForCausalLM(BloomPreTrainedModel):
+         model_inputs.update(
+             {
+                 "past_key_values": past_key_values,
++                "position_ids": position_ids,
+                 "use_cache": kwargs.get("use_cache"),
+                 "attention_mask": attention_mask,
++                "attention_logit_biases": attention_logit_biases,
+             }
+         )
+         return model_inputs
+@@ -826,11 +864,14 @@ class BloomForCausalLM(BloomPreTrainedModel):
+     def forward(
+         self,
+         input_ids: Optional[torch.LongTensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
+         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         head_mask: Optional[torch.Tensor] = None,
+         inputs_embeds: Optional[torch.Tensor] = None,
+         labels: Optional[torch.Tensor] = None,
++        shift_labels: bool = True,
+         use_cache: Optional[bool] = None,
+         output_attentions: Optional[bool] = None,
+         output_hidden_states: Optional[bool] = None,
+@@ -843,13 +884,6 @@ class BloomForCausalLM(BloomPreTrainedModel):
+             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
+             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+         """
+-        if deprecated_arguments.pop("position_ids", False) is not False:
+-            # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
+-            warnings.warn(
+-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
+-                " passing `position_ids`.",
+-                FutureWarning,
+-            )
+         if len(deprecated_arguments) > 0:
+             raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
+ 
+@@ -857,8 +891,10 @@ class BloomForCausalLM(BloomPreTrainedModel):
+ 
+         transformer_outputs = self.transformer(
+             input_ids,
++            position_ids=position_ids,
+             past_key_values=past_key_values,
+             attention_mask=attention_mask,
++            attention_logit_biases=attention_logit_biases,
+             head_mask=head_mask,
+             inputs_embeds=inputs_embeds,
+             use_cache=use_cache,
+@@ -875,14 +911,27 @@ class BloomForCausalLM(BloomPreTrainedModel):
+             # move labels to correct device to enable model parallelism
+             labels = labels.to(lm_logits.device)
+             # Shift so that tokens < n predict n
+-            shift_logits = lm_logits[..., :-1, :].contiguous()
+-            shift_labels = labels[..., 1:].contiguous()
+-            batch_size, seq_length, vocab_size = shift_logits.shape
++            if shift_labels:
++                lm_logits = lm_logits[..., :-1, :].contiguous()
++                if labels.ndim == lm_logits.ndim - 1:
++                    labels = labels[..., 1:].contiguous()
++                else:
++                    assert labels.ndim == lm_logits.ndim
++                    assert labels.dtype.is_floating_point
++                    labels = labels[..., 1:, :].contiguous()
++            batch_size, seq_length, vocab_size = lm_logits.shape
+             # Flatten the tokens
+-            loss_fct = CrossEntropyLoss()
+-            loss = loss_fct(
+-                shift_logits.view(batch_size * seq_length, vocab_size), shift_labels.view(batch_size * seq_length)
+-            )
++            logits_flattened = lm_logits.view(batch_size * seq_length, vocab_size)
++            if labels.ndim == lm_logits.ndim - 1:
++                loss_fct = CrossEntropyLoss()
++                loss = loss_fct(logits_flattened, labels.view(batch_size * seq_length))
++            else:
++                loss_fct = CrossEntropyLoss(reduction="none")
++                assert labels.ndim == lm_logits.ndim
++                labels_flattened = labels.view(batch_size * seq_length, vocab_size)
++                include_indices = ~torch.isclose(labels_flattened.sum(dim=-1), labels_flattened.new_full([1], -100.0))
++                # Comupte loss (non-reduced), exclude meaningless instances, then reduce.
++                loss = loss_fct(logits_flattened, labels_flattened)[include_indices].mean()
+ 
+         if not return_dict:
+             output = (lm_logits,) + transformer_outputs[1:]
+diff --git a/src/transformers/models/llama/modeling_llama.py b/src/transformers/models/llama/modeling_llama.py
+index bba2680f5..7f5e64d08 100644
+--- a/src/transformers/models/llama/modeling_llama.py
++++ b/src/transformers/models/llama/modeling_llama.py
+@@ -17,11 +17,13 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-""" PyTorch LLaMA model."""
++"""PyTorch LLaMA model."""
++
+ import math
+ import warnings
+ from typing import List, Optional, Tuple, Union
+ 
++import einops
+ import torch
+ import torch.nn.functional as F
+ import torch.utils.checkpoint
+@@ -120,6 +122,31 @@ class LlamaRMSNorm(nn.Module):
+ ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
+ 
+ 
++class OTFLlamaRotaryEmbedding(nn.Module):
++    # On-the-fly version, capable of interpolation.
++    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
++        super().__init__()
++        self.dim = dim
++        self.max_position_embeddings = max_position_embeddings
++        self.base = base
++        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++
++    def forward(self, position_ids):
++        assert position_ids.ndim == 2
++
++        # t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
++        t = position_ids.to(device=self.inv_freq.device, dtype=self.inv_freq.dtype)
++        # freqs = torch.einsum("bi,j->b,ij", t, self.inv_freq)
++        freqs = einops.einsum(t, self.inv_freq, "b i, j -> b i j")
++        # Different from paper, but it uses a different permutation in order to obtain the same calculation
++        emb = torch.cat((freqs, freqs), dim=-1)
++
++        # self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(x.dtype), persistent=False)
++        # self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(x.dtype), persistent=False)
++        return emb.cos(), emb.sin()
++
++
+ class LlamaRotaryEmbedding(nn.Module):
+     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+         super().__init__()
+@@ -208,7 +235,7 @@ def rotate_half(x):
+     return torch.cat((-x2, x1), dim=-1)
+ 
+ 
+-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
++def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+     """Applies Rotary Position Embedding to the query and key tensors.
+ 
+     Args:
+@@ -229,8 +256,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+     Returns:
+         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+     """
+-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
++    assert unsqueeze_dim == 1
++    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
++    assert sin.shape == cos.shape
++    assert sin.ndim == 3
++    cos = cos[:, None, :, :]  # [b, 1, seq_len, dim]
++    sin = sin[:, None, :, :]  # [b, 1, seq_len, dim]
+     q_embed = (q * cos) + (rotate_half(q) * sin)
+     k_embed = (k * cos) + (rotate_half(k) * sin)
+     return q_embed, k_embed
+@@ -320,12 +351,16 @@ class LlamaAttention(nn.Module):
+ 
+     def _init_rope(self):
+         if self.config.rope_scaling is None:
+-            self.rotary_emb = LlamaRotaryEmbedding(
+-                self.head_dim,
+-                max_position_embeddings=self.max_position_embeddings,
+-                base=self.rope_theta,
++            self.rotary_emb = OTFLlamaRotaryEmbedding(
++                self.head_dim, max_position_embeddings=self.max_position_embeddings, base=self.rope_theta
+             )
++            # self.rotary_emb = LlamaRotaryEmbedding(
++            #     self.head_dim,
++            #     max_position_embeddings=self.max_position_embeddings,
++            #     base=self.rope_theta,
++            # )
+         else:
++            assert False
+             scaling_type = self.config.rope_scaling["type"]
+             scaling_factor = self.config.rope_scaling["factor"]
+             if scaling_type == "linear":
+@@ -355,6 +390,7 @@ class LlamaAttention(nn.Module):
+         position_ids: Optional[torch.LongTensor] = None,
+         past_key_value: Optional[Cache] = None,
+         output_attentions: bool = False,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         use_cache: bool = False,
+         **kwargs,
+     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+@@ -400,8 +436,10 @@ class LlamaAttention(nn.Module):
+                     "with a layer index."
+                 )
+             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
++        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
++        cos, sin = self.rotary_emb(position_ids)
++        # [bsz, nh, t, hd]
++        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+ 
+         if past_key_value is not None:
+             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+@@ -426,6 +464,11 @@ class LlamaAttention(nn.Module):
+             attn_weights = attn_weights + attention_mask
+ 
+         # upcast attention to fp32
++        attn_weights = attn_weights.to(dtype=torch.float32)
++
++        # TODO(tmerth): Could just merge this logic with `attention_mask`.
++        if attention_logit_biases is not None:
++            attn_weights += attention_logit_biases[:, None, :, :]
+         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+         attn_output = torch.matmul(attn_weights, value_states)
+@@ -766,6 +809,7 @@ class LlamaDecoderLayer(nn.Module):
+         position_ids: Optional[torch.LongTensor] = None,
+         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+         output_attentions: Optional[bool] = False,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         use_cache: Optional[bool] = False,
+         **kwargs,
+     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+@@ -799,6 +843,7 @@ class LlamaDecoderLayer(nn.Module):
+             position_ids=position_ids,
+             past_key_value=past_key_value,
+             output_attentions=output_attentions,
++            attention_logit_biases=attention_logit_biases,
+             use_cache=use_cache,
+             **kwargs,
+         )
+@@ -980,6 +1025,7 @@ class LlamaModel(LlamaPreTrainedModel):
+         use_cache: Optional[bool] = None,
+         output_attentions: Optional[bool] = None,
+         output_hidden_states: Optional[bool] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         return_dict: Optional[bool] = None,
+     ) -> Union[Tuple, BaseModelOutputWithPast]:
+         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+@@ -1000,19 +1046,30 @@ class LlamaModel(LlamaPreTrainedModel):
+         else:
+             raise ValueError("You have to specify either input_ids or inputs_embeds")
+ 
++        seq_length_with_past = seq_length
+         past_key_values_length = 0
++
+         if use_cache:
+             use_legacy_cache = not isinstance(past_key_values, Cache)
+             if use_legacy_cache:
+                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+             past_key_values_length = past_key_values.get_usable_length(seq_length)
++            seq_length_with_past = seq_length_with_past + past_key_values_length
+ 
+         if position_ids is None:
++            assert False
+             device = input_ids.device if input_ids is not None else inputs_embeds.device
+             position_ids = torch.arange(
+                 past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+             )
+             position_ids = position_ids.unsqueeze(0)
++            # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
++        else:
++            position_ids = position_ids[:, :seq_length]
++            assert position_ids.numel() > 0
++        if attention_logit_biases is not None:
++            attention_logit_biases = attention_logit_biases[:, :seq_length, :seq_length_with_past]
++            assert attention_logit_biases.numel() > 0
+ 
+         if inputs_embeds is None:
+             inputs_embeds = self.embed_tokens(input_ids)
+@@ -1071,6 +1128,7 @@ class LlamaModel(LlamaPreTrainedModel):
+                     position_ids=position_ids,
+                     past_key_value=past_key_values,
+                     output_attentions=output_attentions,
++                    attention_logit_biases=attention_logit_biases,
+                     use_cache=use_cache,
+                 )
+ 
+@@ -1144,6 +1202,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+         use_cache: Optional[bool] = None,
+         output_attentions: Optional[bool] = None,
+         output_hidden_states: Optional[bool] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
++        shift_labels: bool = True,
+         return_dict: Optional[bool] = None,
+     ) -> Union[Tuple, CausalLMOutputWithPast]:
+         r"""
+@@ -1187,6 +1247,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+             use_cache=use_cache,
+             output_attentions=output_attentions,
+             output_hidden_states=output_hidden_states,
++            attention_logit_biases=attention_logit_biases,
+             return_dict=return_dict,
+         )
+ 
+@@ -1201,16 +1262,25 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+ 
+         loss = None
+         if labels is not None:
+-            # Shift so that tokens < n predict n
+-            shift_logits = logits[..., :-1, :].contiguous()
+-            shift_labels = labels[..., 1:].contiguous()
++            if shift_labels:
++                # Shift so that tokens < n predict n
++                _logits = logits[..., :-1, :].contiguous()
++                _labels = labels[..., 1:].contiguous()
++            else:
++                _logits = logits
++                _labels = labels
+             # Flatten the tokens
+             loss_fct = CrossEntropyLoss()
+-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+-            shift_labels = shift_labels.view(-1)
++            B, S, V = _logits.shape
++            assert V == self.config.vocab_size
++            _logits = _logits.view(B * S, self.config.vocab_size)
++            if _labels.ndim == 3:
++                _labels = _labels.view(B * S, self.config.vocab_size)
++            else:
++                _labels = _labels.view(B * S)
+             # Enable model parallelism
+-            shift_labels = shift_labels.to(shift_logits.device)
+-            loss = loss_fct(shift_logits, shift_labels)
++            _labels = _labels.to(_logits.device)
++            loss = loss_fct(_logits, _labels)
+ 
+         if not return_dict:
+             output = (logits,) + outputs[1:]
+@@ -1225,44 +1295,41 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+         )
+ 
+     def prepare_inputs_for_generation(
+-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
++        self,
++        input_ids,
++        position_ids=None,
++        past_key_values=None,
++        attention_mask=None,
++        attention_logit_biases=None,
++        inputs_embeds=None,
++        **kwargs,
+     ):
+-        if past_key_values is not None:
+-            if isinstance(past_key_values, Cache):
+-                cache_length = past_key_values.get_seq_length()
+-                past_length = past_key_values.seen_tokens
+-                max_cache_length = past_key_values.get_max_length()
+-            else:
+-                cache_length = past_length = past_key_values[0][0].shape[2]
+-                max_cache_length = None
+-
+-            # Keep only the unprocessed tokens:
+-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+-            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
+-            # input)
+-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+-            # input_ids based on the past_length.
+-            elif past_length < input_ids.shape[1]:
+-                input_ids = input_ids[:, past_length:]
+-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+-
+-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+-            if (
+-                max_cache_length is not None
+-                and attention_mask is not None
+-                and cache_length + input_ids.shape[1] > max_cache_length
+-            ):
+-                attention_mask = attention_mask[:, -max_cache_length:]
+-
+-        position_ids = kwargs.get("position_ids", None)
++        assert input_ids.ndim == 2
++        assert position_ids is not None
++        seq_length_with_past = input_ids.shape[-1]
++
++        if past_key_values:
++            past_key_values_length = past_key_values[0][0].shape[2]
++            # seq_length_with_past = input_ids.shape[-1]
++            # input_ids = input_ids[:, -1:]
++            assert seq_length_with_past - past_key_values_length >= 1
++            input_ids = input_ids[:, past_key_values_length:]
++            seq_length = input_ids.shape[-1]
++
++            position_ids = position_ids[:, past_key_values_length:seq_length_with_past]
++            assert position_ids.numel() == seq_length
++            if attention_logit_biases is not None:
++                attention_logit_biases = attention_logit_biases[
++                    :, past_key_values_length:seq_length_with_past, :seq_length_with_past
++                ]
++
+         if attention_mask is not None and position_ids is None:
++            assert False
+             # create position_ids on the fly for batch generation
+-            position_ids = attention_mask.long().cumsum(-1) - 1
+-            position_ids.masked_fill_(attention_mask == 0, 1)
+-            if past_key_values:
+-                position_ids = position_ids[:, -input_ids.shape[1] :]
++            # position_ids = attention_mask.long().cumsum(-1) - 1
++            # position_ids.masked_fill_(attention_mask == 0, 1)
++            # if past_key_values:
++            #     position_ids = position_ids[:, -input_ids.shape[1] :]
+ 
+         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+         if inputs_embeds is not None and past_key_values is None:
+@@ -1276,6 +1343,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+                 "past_key_values": past_key_values,
+                 "use_cache": kwargs.get("use_cache"),
+                 "attention_mask": attention_mask,
++                "attention_logit_biases": attention_logit_biases,
+             }
+         )
+         return model_inputs
+diff --git a/src/transformers/models/mpt/modeling_mpt.py b/src/transformers/models/mpt/modeling_mpt.py
+index ae8e7e903..45f5d38c7 100644
+--- a/src/transformers/models/mpt/modeling_mpt.py
++++ b/src/transformers/models/mpt/modeling_mpt.py
+@@ -26,6 +26,7 @@ from torch.nn import functional as F
+ from ...file_utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward
+ from ...modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+ from ...modeling_outputs import (
++    AttentionReduction,
+     BaseModelOutputWithPastAndCrossAttentions,
+     CausalLMOutputWithCrossAttentions,
+     QuestionAnsweringModelOutput,
+@@ -56,14 +57,19 @@ MPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
+ ]
+ 
+ 
+-def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8, device=None):
++def build_mpt_alibi_tensor(num_heads, position_ids: Optional[torch.Tensor], alibi_bias_max=8, device=None):
+     r"""
+     Link to paper: https://arxiv.org/abs/2108.12409 - Alibi tensor is not causal as the original paper mentions, it
+     relies on a translation invariance of softmax for quick implementation. This implementation has been copied from
+     the alibi implementation of MPT source code that led to slightly different results than the Bloom alibi:
+     https://huggingface.co/mosaicml/mpt-7b/blob/main/attention.py#L292
+     """
+-    alibi = torch.arange(1 - sequence_length, 1, dtype=torch.int32, device=device).view(1, 1, 1, sequence_length)
++    assert position_ids is not None
++    assert position_ids.ndim == 2
++    assert position_ids.shape[0] == 1
++    sequence_length = position_ids.numel()
++
++    alibi = position_ids.view(1, 1, 1, sequence_length).to(device)
+     num_heads_power_of_2 = 2 ** math.ceil(math.log2(num_heads))
+ 
+     base = torch.arange(1, num_heads_power_of_2 + 1, dtype=torch.float32, device=device)
+@@ -104,6 +110,7 @@ class MptAttention(nn.Module):
+         position_bias: torch.Tensor,
+         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+     ):
+         batch_size, seq_length = hidden_states.shape[:2]
+ 
+@@ -113,6 +120,13 @@ class MptAttention(nn.Module):
+         key_states = key_states.reshape(batch_size, seq_length, self.n_heads, self.head_dim).transpose(1, 2)
+         value_states = value_states.reshape(batch_size, seq_length, self.n_heads, self.head_dim).transpose(1, 2)
+ 
++        # NOTE(tmerth): This needs to run before the unconditional line `past_key_value = (key_states, value_states)`.
++        _seq_length_with_past = seq_length
++        _past_key_values_length = 0
++        if past_key_value is not None:
++            _past_key_values_length = past_key_value[0].shape[2]
++            _seq_length_with_past = _seq_length_with_past + _past_key_values_length
++
+         if past_key_value is not None:
+             if len(past_key_value) != 0:
+                 key_states = torch.cat([past_key_value[0], key_states], dim=2)
+@@ -130,15 +144,28 @@ class MptAttention(nn.Module):
+                 raise ValueError(f"Expecting position_bias shape to be 3 dimensions, got {len(position_bias.shape)}")
+             key_length = key_states.shape[-2]
+ 
+-            position_bias_query_index = max(0, position_bias.size(1) - query_length)
+-            position_bias_key_index = max(0, position_bias.size(2) - key_length)
+-
+-            position_bias = position_bias[:, position_bias_query_index:, position_bias_key_index:]
++            if past_key_value is not None:
++                end_idx = _past_key_values_length + seq_length
++                # position_bias = position_bias[:, _past_key_values_length:end_idx, :_seq_length_with_past]
++                position_bias = position_bias[:, :, :_seq_length_with_past]
++                orig_shape = attention_scores.shape
++                attention_scores = attention_scores + position_bias
++                assert attention_scores.shape == orig_shape
++            else:
++                assert False
++                position_bias_query_index = max(0, position_bias.size(1) - query_length)
++                position_bias_key_index = max(0, position_bias.size(2) - key_length)
++                position_bias = position_bias[:, position_bias_query_index:, position_bias_key_index:]
+ 
+-            attention_scores = attention_scores + position_bias
++        if attention_logit_biases is not None:
++            end_idx = _past_key_values_length + seq_length
++            attention_logit_biases = attention_logit_biases.to(hidden_states.device)[
++                :, None, _past_key_values_length:end_idx, :_seq_length_with_past
++            ]
++            attention_scores = attention_scores + attention_logit_biases
+ 
+-        if attention_mask is not None:
+-            attention_scores = attention_scores.masked_fill(attention_mask, torch.finfo(query_states.dtype).min)
++        # if attention_mask is not None:
++        #     attention_scores = attention_scores.masked_fill(attention_mask, torch.finfo(query_states.dtype).min)
+ 
+         # (batch_size, n_heads, seq_length, key_length)
+         attn_weights = nn.functional.softmax(attention_scores.float(), dim=-1).to(value_states.dtype)
+@@ -198,6 +225,7 @@ class MptBlock(nn.Module):
+         hidden_states: torch.Tensor,
+         position_bias: torch.Tensor,
+         attention_mask: torch.Tensor,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+         use_cache: bool = False,
+         output_attentions: bool = False,
+@@ -213,6 +241,7 @@ class MptBlock(nn.Module):
+             layernorm_output,
+             position_bias=position_bias,
+             attention_mask=attention_mask,
++            attention_logit_biases=attention_logit_biases,
+             past_key_value=layer_past,
+         )
+ 
+@@ -230,7 +259,10 @@ class MptBlock(nn.Module):
+         if use_cache:
+             outputs += (past_key_value,)
+ 
+-        if output_attentions:
++        if output_attentions == AttentionReduction.LAYER_AND_HEAD:
++            # (batch_size, n_heads, seq_length, key_length)
++            attn_weights = attn_weights.mean(dim=1)
++        if output_attentions not in [False, None]:
+             outputs += (attn_weights,)
+ 
+         return outputs  # hidden_states, present, attentions
+@@ -378,9 +410,6 @@ class MptModel(MptPreTrainedModel):
+     def get_input_embeddings(self):
+         return self.wte
+ 
+-    def build_mpt_alibi_tensor(self, num_heads, sequence_length, alibi_bias_max=8, device=None):
+-        return build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max, device)
+-
+     def set_input_embeddings(self, new_embeddings: torch.Tensor):
+         self.wte = new_embeddings
+ 
+@@ -394,7 +423,9 @@ class MptModel(MptPreTrainedModel):
+         self,
+         input_ids: Optional[torch.LongTensor] = None,
+         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
++        position_ids: Optional[torch.LongTensor] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         inputs_embeds: Optional[torch.LongTensor] = None,
+         use_cache: Optional[bool] = None,
+         output_attentions: Optional[bool] = None,
+@@ -442,12 +473,21 @@ class MptModel(MptPreTrainedModel):
+         if past_key_values[0] is not None:
+             past_key_values_length = past_key_values[0][0].shape[2]
+             seq_length_with_past = seq_length_with_past + past_key_values_length
+-        if attention_mask is None:
+-            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
++
++        assert attention_mask is None or torch.all(attention_mask == 1)
++        # if attention_mask is None:
++        #     attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
++        # else:
++        #     attention_mask = attention_mask.to(hidden_states.device)
++
++        if position_ids is not None:
++            assert position_ids.shape[-1] >= input_ids.shape[-1], f"{position_ids.shape[-1]} vs. {input_ids.shape[-1]}"
+         else:
+-            attention_mask = attention_mask.to(hidden_states.device)
++            position_ids = torch.arange(
++                1 - seq_length_with_past, 1, dtype=torch.int32, device=hidden_states.device
++            ).view(1, seq_length_with_past)
+ 
+-        alibi = self.build_mpt_alibi_tensor(self.num_heads, self.config.max_seq_len, device=hidden_states.device)
++        alibi = build_mpt_alibi_tensor(self.num_heads, position_ids=position_ids, device=hidden_states.device)
+ 
+         causal_mask = _prepare_4d_causal_attention_mask(
+             attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+@@ -473,6 +513,7 @@ class MptModel(MptPreTrainedModel):
+                     hidden_states,
+                     layer_past=layer_past,
+                     attention_mask=causal_mask,
++                    attention_logit_biases=attention_logit_biases,
+                     use_cache=use_cache,
+                     output_attentions=output_attentions,
+                     position_bias=alibi,
+@@ -530,7 +571,9 @@ class MptForCausalLM(MptPreTrainedModel):
+         self,
+         input_ids: torch.LongTensor,
+         past_key_values: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         inputs_embeds: Optional[torch.Tensor] = None,
+         use_cache: Optional[bool] = None,
+         **kwargs,
+@@ -556,9 +599,11 @@ class MptForCausalLM(MptPreTrainedModel):
+ 
+         model_inputs.update(
+             {
++                "position_ids": position_ids,
+                 "past_key_values": past_key_values,  # NITS should it be layer_past?
+                 "use_cache": use_cache,
+                 "attention_mask": attention_mask,
++                "attention_logit_biases": attention_logit_biases,
+             }
+         )
+         return model_inputs
+@@ -573,10 +618,13 @@ class MptForCausalLM(MptPreTrainedModel):
+         self,
+         input_ids: Optional[torch.LongTensor] = None,
+         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
++        position_ids: Optional[torch.LongTensor] = None,
+         attention_mask: Optional[torch.Tensor] = None,
++        attention_logit_biases: Optional[torch.Tensor] = None,
+         inputs_embeds: Optional[torch.Tensor] = None,
+         labels: Optional[torch.Tensor] = None,
+         use_cache: Optional[bool] = None,
++        shift_labels: bool = True,
+         output_attentions: Optional[bool] = None,
+         output_hidden_states: Optional[bool] = None,
+         return_dict: Optional[bool] = None,
+@@ -593,6 +641,8 @@ class MptForCausalLM(MptPreTrainedModel):
+             input_ids,
+             past_key_values=past_key_values,
+             attention_mask=attention_mask,
++            attention_logit_biases=attention_logit_biases,
++            position_ids=position_ids,
+             inputs_embeds=inputs_embeds,
+             use_cache=use_cache,
+             output_attentions=output_attentions,
+@@ -607,15 +657,33 @@ class MptForCausalLM(MptPreTrainedModel):
+         if labels is not None:
+             # move labels to correct device to enable model parallelism
+             labels = labels.to(lm_logits.device)
+-            # Shift so that tokens < n predict n
+-            shift_logits = lm_logits[..., :-1, :].contiguous()
+-            shift_labels = labels[..., 1:].contiguous()
+-            batch_size, seq_length, vocab_size = shift_logits.shape
++
++            if shift_labels:
++                # Shift so that tokens < n predict n
++                maybe_shifted_logits = lm_logits[..., :-1, :].contiguous()
++                if labels.ndim == lm_logits.ndim - 1:
++                    maybe_shifted_labels = labels[..., 1:].contiguous()
++                else:
++                    assert labels.ndim == lm_logits.ndim
++                    assert labels.dtype.is_floating_point
++                    maybe_shifted_labels = labels[..., 1:, :].contiguous()
++            else:
++                maybe_shifted_logits = lm_logits
++                maybe_shifted_labels = labels
++
++            batch_size, seq_length, vocab_size = maybe_shifted_logits.shape
+             # Flatten the tokens
+             loss_fct = CrossEntropyLoss()
+-            loss = loss_fct(
+-                shift_logits.view(batch_size * seq_length, vocab_size), shift_labels.view(batch_size * seq_length)
+-            )
++
++            logits_flattened = maybe_shifted_logits.view(batch_size * seq_length, vocab_size)
++            if maybe_shifted_labels.ndim == maybe_shifted_logits.ndim - 1:
++                loss = loss_fct(logits_flattened, maybe_shifted_labels.view(batch_size * seq_length))
++            else:
++                loss_fct = CrossEntropyLoss(reduction="none")
++                assert maybe_shifted_labels.ndim == maybe_shifted_logits.ndim
++                labels_flattened = maybe_shifted_labels.view(batch_size * seq_length, vocab_size)
++                # Comupte loss (non-reduced), exclude meaningless instances, then reduce.
++                loss = loss_fct(logits_flattened, labels_flattened).mean()
+ 
+         if not return_dict:
+             output = (lm_logits,) + transformer_outputs[1:]
+diff --git a/src/transformers/prompting/__init__.py b/src/transformers/prompting/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/src/transformers/prompting/superposition/__init__.py b/src/transformers/prompting/superposition/__init__.py
+new file mode 100644
+index 000000000..33f84ac62
+--- /dev/null
++++ b/src/transformers/prompting/superposition/__init__.py
+@@ -0,0 +1,2 @@
++from .core import *
++from .forkjoin import *
+diff --git a/src/transformers/prompting/superposition/core.py b/src/transformers/prompting/superposition/core.py
+new file mode 100644
+index 000000000..50d0328bb
+--- /dev/null
++++ b/src/transformers/prompting/superposition/core.py
+@@ -0,0 +1,546 @@
++import abc
++import logging
++import warnings
++from dataclasses import dataclass, replace
++from itertools import chain
++from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
++
++import networkx as nx
++import numpy as np
++import torch
++from matplotlib import pyplot as plt
++from torch.nn import functional as F
++
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class SuperpositionPrompt:
++    input_ids: torch.LongTensor
++    position_ids: torch.LongTensor
++    attention_logit_biases: torch.Tensor
++    node_idx_map: Optional[Mapping[int, int]]  # map from node_idx to array index
++    _digraph: Optional[nx.DiGraph]
++
++    def is_valid_representation(self) -> bool:
++        _, L, _L = self.attention_logit_biases.shape
++        batch_size = self.input_ids.shape[0] == self.position_ids.shape[0] == self.attention_logit_biases.shape[0] == 1
++        # ii = self.input_ids.shape[-1] == L
++        alb = L == _L
++        pos = self.position_ids.shape[-1] == L
++        return batch_size and alb and pos
++
++    def extend(self, input_ids: torch.Tensor) -> "SuperpositionPrompt":
++        assert self.is_valid_representation()
++        L = self.position_ids.shape[-1]
++
++        # Input ids.
++        assert self.input_ids.ndim == input_ids.ndim
++        new_input_ids = torch.cat([self.input_ids, input_ids], dim=-1)
++        new_length = new_input_ids.shape[-1]
++
++        new_kwargs = {}
++        if L < new_length:
++            # Attention logit biases.
++            new_attention_logit_biases = torch.tril(self.attention_logit_biases.new_ones((1, new_length, new_length)))
++            new_attention_logit_biases[..., :L, :L] = self.attention_logit_biases
++            new_kwargs["attention_logit_biases"] = new_attention_logit_biases
++
++            # Position ids.
++            actual_extend_length = new_length - L
++            new_position_ids_deltas = (
++                1
++                + torch.arange(actual_extend_length, dtype=self.position_ids.dtype, device=self.position_ids.device)[
++                    None, :
++                ]
++            )
++            extend_position_ids = self.position_ids.max() + new_position_ids_deltas
++            new_kwargs["position_ids"] = torch.cat([self.position_ids, extend_position_ids], dim=-1)
++
++        res = replace(
++            self,
++            input_ids=new_input_ids,
++            node_idx_map=None,
++            _digraph=None,
++            **new_kwargs,
++        )
++        assert res.is_valid_representation()
++        return res
++
++    def to(self, **kwargs) -> "SuperpositionPrompt":
++        return replace(
++            self,
++            input_ids=self.input_ids.to(**kwargs),
++            position_ids=self.position_ids.to(**kwargs),
++            attention_logit_biases=self.attention_logit_biases.to(**kwargs),
++        )
++
++
++@dataclass
++class NestedNodePayload:
++    subgraph: nx.DiGraph  # where nodes contain either NestedNodePayload or SuperpositionPromptNodePayload
++
++
++@dataclass
++class NodePayload:
++    input_id: torch.Tensor
++
++
++@dataclass
++class NodePosition:
++    position_ids: torch.Tensor
++
++
++@dataclass
++class NodePredictions:
++    logits: torch.Tensor
++
++
++def digraph_is_path_graph(digraph: nx.DiGraph) -> bool:
++    res = not digraph_is_nested(digraph)
++
++    n_edges = len(digraph.edges())
++    n_nodes = len(digraph.nodes())
++    sources, sinks = get_digraph_sources_and_sinks(digraph)
++    n_sources = len(sources)
++    n_sinks = len(sinks)
++
++    res = res and (n_nodes == n_edges + 1)
++    res = res and (n_sources == 1)
++    res = res and (n_sinks == 1)
++
++    # Check max in-edges.
++    res = res and (max(digraph.in_degree(node_idx) for node_idx in digraph.nodes()) <= 1)
++
++    # Check max out-edges.
++    res = res and (max(digraph.out_degree(node_idx) for node_idx in digraph.nodes()) <= 1)
++
++    return res
++
++
++def digraph_is_nested(digraph: nx.DiGraph) -> bool:
++    for node in digraph.nodes(data=True):
++        if "payload" in node[1] and isinstance(node[1]["payload"], NestedNodePayload):
++            return True
++    return False
++
++
++def get_digraph_nodes(digraph: nx.DiGraph) -> List[int]:
++    res = []
++    for node in digraph.nodes(data=True):
++        node_payload = node[1]["payload"]
++        if isinstance(node_payload, NestedNodePayload):
++            res.extend(get_digraph_nodes(node_payload.subgraph))
++        else:
++            res.append(node[0])
++
++    assert len(set(res)) == len(res)
++    return res
++
++
++def get_digraph_sources_and_sinks(digraph: nx.DiGraph) -> Tuple[List[int], List[int]]:
++    sources = [node_idx for node_idx in digraph.nodes() if digraph.in_degree(node_idx) == 0]
++    sinks = [node_idx for node_idx in digraph.nodes() if digraph.out_degree(node_idx) == 0]
++
++    if digraph_is_nested(digraph):
++
++        def _sinks_and_sources(idx):
++            return get_digraph_sources_and_sinks(digraph.nodes(data=True)[idx]["payload"].subgraph)
++
++        sources = [s1 for source_idx in sources for s1 in _sinks_and_sources(source_idx)[0]]
++        sinks = [s2 for sink_idx in sinks for s2 in _sinks_and_sources(sink_idx)[1]]
++
++    return sources, sinks
++
++
++def digraph_is_auto_wireable(digraph: nx.DiGraph) -> bool:
++    assert not digraph_is_nested(digraph)
++    sources, sinks = get_digraph_sources_and_sinks(digraph)
++    return len(sources) == 1 and len(sinks) == 1
++
++
++class DigraphFlattenPolicy(abc.ABC):
++    pass
++
++
++class AutoWire(DigraphFlattenPolicy):
++    pass
++
++
++def maybe_flatten_nested_digraph_warn_inefficient(digraph: nx.DiGraph) -> nx.DiGraph:
++    if digraph_is_nested(digraph):
++        warnings.warn(
++            "Manually flattened graph, which may be inefficient. Pass a flattened graph to amortize flattening time cost."
++        )
++        return flatten_nested_digraph(digraph)
++    return digraph
++
++
++def flatten_nested_digraph(
++    nested_digraph: nx.DiGraph,
++    flatten_policy: DigraphFlattenPolicy = AutoWire(),
++) -> nx.DiGraph:
++    if not digraph_is_nested(nested_digraph):
++        assert isinstance(flatten_policy, AutoWire), "Undefined"
++        return nested_digraph
++    topo_sorted_nodes = list(iter(nx.lexicographical_topological_sort(nested_digraph)))
++    flattened_digraph = nx.DiGraph()
++
++    for nested_node_idx in topo_sorted_nodes:
++        node_data = nested_digraph.nodes(data=True)[nested_node_idx]
++        subgraph = node_data["payload"].subgraph
++        if digraph_is_nested(subgraph):
++            subgraph = flatten_nested_digraph(subgraph, flatten_policy)
++        assert not digraph_is_nested(subgraph)
++
++        # Ensure the subgraph we're adding doesn't collide with anything in the graph already.
++        assert not any(subgraph_node_idx in flattened_digraph.nodes() for subgraph_node_idx in subgraph.nodes())
++        flattened_digraph.add_nodes_from(subgraph.nodes(data=True))
++
++        upstream_edges = nested_digraph.in_edges(nested_node_idx)
++        upstream_nested_subgraphs = [nested_digraph.nodes(data=True)[u]["payload"].subgraph for u, _ in upstream_edges]
++
++        if isinstance(flatten_policy, AutoWire):
++            # Step 1: Set edges for upstream nodes within current subgraph.
++            flattened_digraph.add_edges_from(subgraph.edges(data=True))
++
++            # Step 2: Set edges from upstream subgraphs.
++            # Figure out which nodes in the subgraph we need to wire.
++            upstream_sinks_nested = [
++                get_digraph_sources_and_sinks(upstream_nested_subgraph)[1]
++                for upstream_nested_subgraph in upstream_nested_subgraphs
++            ]
++            upstream_sinks = list(chain.from_iterable(upstream_sinks_nested))
++
++            subgraph_sources, _ = get_digraph_sources_and_sinks(subgraph)
++
++            # Wire up the upstream and downstream subgraphs.
++            for upstream_sink in upstream_sinks:
++                for subgraph_source in subgraph_sources:
++                    flattened_digraph.add_edge(upstream_sink, subgraph_source)
++        else:
++            assert False
++
++    assert not digraph_is_nested(flattened_digraph)
++    return flattened_digraph
++
++
++############
++# BUILDING #
++############
++
++
++def phrase_as_path_digraph(input_ids: torch.Tensor, start_idx: int) -> nx.DiGraph:
++    assert start_idx >= 0
++    graph = nx.DiGraph()
++    cur = start_idx
++    assert input_ids.ndim == 2
++    assert input_ids.shape[0] == 1
++
++    for input_id in input_ids.flatten():
++        graph.add_node(cur, payload=NodePayload(input_id=input_id))
++        if cur > start_idx:
++            graph.add_edge(cur - 1, cur)
++        cur += 1
++    return graph
++
++
++class NestedDigraphBuilder:
++    def __init__(self):
++        self.nested_digraph = nx.DiGraph()
++        self.inner_node_idx = 0
++        self.outer_node_idx = 0
++
++    def add_nested_node(self, input_ids: torch.Tensor) -> Tuple[nx.DiGraph, int]:
++        digraph = phrase_as_path_digraph(input_ids, self.inner_node_idx)
++        self.inner_node_idx = max(digraph.nodes()) + 1
++        self.nested_digraph.add_node(self.outer_node_idx, payload=NestedNodePayload(subgraph=digraph))
++        self.outer_node_idx += 1
++        return digraph, self.outer_node_idx - 1
++
++
++#########
++# UTILS #
++#########
++
++
++def node_idx_dict_to_sorted_data_list(node_idx_dict: Dict[int, Any]) -> List[Any]:
++    nodes_with_data = node_idx_dict.items()
++    nodes_with_data_sorted = sorted(nodes_with_data, key=lambda x: x[0])
++    return [x[1] for x in nodes_with_data_sorted]
++
++
++def lex_topo_digraph_traversal(digraph: nx.DiGraph, node_idx_node_data_fn: Callable[[int, nx.DiGraph], Any]):
++    """
++    Assumption 1: if digraph is nested, then all nodes are nested.
++    """
++    if len(digraph) > 0:
++        lex_topo_sorted_node_idxs = list(nx.lexicographical_topological_sort(digraph))
++        if digraph_is_nested(digraph):
++            for node_idx in lex_topo_sorted_node_idxs:
++                nested_node_data = digraph.nodes(data=True)[node_idx]
++                yield from lex_topo_digraph_traversal(nested_node_data["payload"].subgraph, node_idx_node_data_fn)
++        else:
++            for node_idx in lex_topo_sorted_node_idxs:
++                yield node_idx_node_data_fn(node_idx, digraph.nodes(data=True)[node_idx])
++
++
++def digraph_traversal(digraph: nx.DiGraph, flat_digraph_fn: Callable[[nx.DiGraph], Any]):
++    if len(digraph) > 0:
++        if digraph_is_nested(digraph):
++            for nested_node_data in dict(digraph.nodes(data=True)).values():
++                yield from digraph_traversal(nested_node_data["payload"].subgraph, flat_digraph_fn)
++        else:
++            yield flat_digraph_fn(digraph)
++
++
++def digraph_total_nodes(digraph: nx.DiGraph):
++    return sum(digraph_traversal(digraph, lambda x: len(x)))
++
++
++def visualize(nested_digraph, superposition_prompt, tokenizer=None):
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++    serializable_ll_digraph = flattened_digraph.copy()
++
++    node_data = serializable_ll_digraph.nodes(data=True)
++    if tokenizer is not None:
++        serializable_node_data = {
++            i: {
++                "input_id": int(data["payload"].input_id.item()),
++                "sentencepiece": tokenizer.decode(int(data["payload"].input_id.item())),
++            }
++            for i, data in node_data
++        }
++    else:
++        serializable_node_data = {
++            i: {
++                "input_id": int(data["payload"].input_id.item()),
++            }
++            for i, data in node_data
++        }
++    nx.set_node_attributes(serializable_ll_digraph, serializable_node_data)
++
++    serializable_edge_data = serializable_ll_digraph.edges(data=True)
++    serializable_edge_data = {
++        (u, v): {key: value.item() if isinstance(value, torch.Tensor) else value for key, value in edge.items()}
++        for u, v, edge in serializable_edge_data
++    }
++
++    nx.set_edge_attributes(serializable_ll_digraph, serializable_edge_data)
++
++    for layer, nodes in enumerate(nx.topological_generations(nested_digraph)):
++        # `multipartite_layout` expects the layer as a node attribute, so add the
++        # numeric layer value as a node attribute
++        for node in nodes:
++            nested_digraph.nodes[node]["layer"] = layer
++    nested_pos_dict = nx.multipartite_layout(nested_digraph, subset_key="layer")
++
++    flattened_pos_dict = {}
++    for nested_node_idx, nested_node_pos in nested_pos_dict.items():
++        y_pos = nested_node_pos[1]
++        for subnode_idx in list(nested_digraph.nodes[nested_node_idx]["payload"].subgraph.nodes()):
++            x_pos = superposition_prompt.position_ids[0, subnode_idx].item()
++            flattened_pos_dict[subnode_idx] = np.array([x_pos, y_pos])
++
++    nodes = nx.draw_networkx_nodes(
++        serializable_ll_digraph,
++        pos=flattened_pos_dict,
++        node_color="white",
++        edgecolors="blue",
++        node_size=100,
++    )
++    label_key = "sentencepiece" if tokenizer is not None else "input_id"
++    nx.draw_networkx_labels(
++        serializable_ll_digraph,
++        pos=flattened_pos_dict,
++        labels={n[0]: f"{n[1][label_key]}" for n in serializable_ll_digraph.nodes(data=True)},
++    )
++    nx.draw_networkx_edges(
++        serializable_ll_digraph,
++        pos=flattened_pos_dict,
++        arrowstyle="->",
++        arrowsize=10,
++        width=2,
++    )
++    ax = plt.gca()
++    ax.set_axis_off()
++    return plt.gcf()
++
++
++###########
++# POS IDS #
++###########
++
++
++def compute_causal_mask_blockwise_recursive(nested_digraph: nx.DiGraph, propagate: bool = True) -> torch.Tensor:
++    """
++    Order of serialized paths are in lexographical superposition order.
++    """
++    assert digraph_is_nested(nested_digraph)
++    device = None
++    lex_topo_sorted_node_idxs = list(nx.lexicographical_topological_sort(nested_digraph))
++    assert len(set(lex_topo_sorted_node_idxs)) == len(lex_topo_sorted_node_idxs)
++    assert lex_topo_sorted_node_idxs == sorted(list(nested_digraph.nodes()))
++
++    reverse_transition_graph = nested_digraph.reverse()
++
++    if propagate:
++        ancestor_graph = nx.transitive_closure_dag(
++            reverse_transition_graph, topo_order=list(reversed(lex_topo_sorted_node_idxs))
++        )
++    else:
++        ancestor_graph = reverse_transition_graph
++    causal_mask_inv_missing_self = torch.tensor(nx.adjacency_matrix(ancestor_graph).todense(), device=device)
++
++    block_masks = []
++
++    for lex_topo_sorted_node_idx in lex_topo_sorted_node_idxs:
++        nested_node_data = nested_digraph.nodes(data=True)[lex_topo_sorted_node_idx]
++        subgraph = nested_node_data["payload"].subgraph
++
++        n = len(subgraph)
++
++        assert not digraph_is_nested(subgraph)
++        device = next(iter(subgraph.nodes(data=True)))[1]["payload"].input_id.device
++
++        assert digraph_is_path_graph(subgraph)
++        block_masks.append(torch.tril(torch.ones((n, n), device=device)))
++
++    block_diag = torch.block_diag(*block_masks)
++    block_mask_dims = torch.tensor([0] + [x.shape[0] for x in block_masks])
++    block_mask_cumsum_dims = torch.cumsum(block_mask_dims, 0)
++
++    for i, j in causal_mask_inv_missing_self.nonzero():
++        i_start = block_mask_cumsum_dims[i]
++        i_end = block_mask_cumsum_dims[i + 1]
++        j_start = block_mask_cumsum_dims[j]
++        j_end = block_mask_cumsum_dims[j + 1]
++        block_diag[i_start:i_end, j_start:j_end] = 1
++    return block_diag
++
++
++def get_position_ids_from_nested_digraph(nested_digraph: nx.DiGraph) -> torch.Tensor:
++    """
++    Order of serialized position IDs are in lexographical superposition order.
++    """
++    assert all("position_ids" in node[1] for node in nested_digraph.nodes(data=True))
++    lex_topo_sorted_node_idxs = list(nx.lexicographical_topological_sort(nested_digraph))
++    position_ids_list = [
++        nested_digraph.nodes[node_idx]["position_ids"].position_ids for node_idx in lex_topo_sorted_node_idxs
++    ]
++    return torch.cat(position_ids_list, dim=-1)
++
++
++def _compute_causal_mask_brute_force(digraph, propagate: bool):
++    reverse_transition_graph = digraph.reverse()
++    lex_topo_sorted_node_idxs = list(nx.lexicographical_topological_sort(digraph))
++    N = digraph.number_of_nodes()
++    device = next(iter(digraph.nodes(data=True)))[1]["payload"].input_id.device
++
++    if propagate:
++        ancestor_graph = nx.transitive_closure_dag(
++            reverse_transition_graph, topo_order=list(reversed(lex_topo_sorted_node_idxs))
++        )
++    else:
++        ancestor_graph = reverse_transition_graph
++
++    causal_mask_inv_missing_self = torch.tensor(nx.adjacency_matrix(ancestor_graph).todense(), device=device)
++    causal_mask_inv = causal_mask_inv_missing_self + torch.eye(
++        N, dtype=causal_mask_inv_missing_self.dtype, device=device
++    )
++    return causal_mask_inv
++
++
++def compute_causal_mask_brute_force_no_propagate(digraph):
++    flattened_digraph = maybe_flatten_nested_digraph_warn_inefficient(digraph)
++    return _compute_causal_mask_brute_force(flattened_digraph, propagate=False)
++
++
++def compute_causal_mask_brute_force(digraph):
++    flattened_digraph = maybe_flatten_nested_digraph_warn_inefficient(digraph)
++    return _compute_causal_mask_brute_force(flattened_digraph, propagate=True)
++
++
++def compute_causal_mask_raw(digraph):
++    flattened_digraph = maybe_flatten_nested_digraph_warn_inefficient(digraph)
++    return _compute_causal_mask_brute_force(flattened_digraph, propagate=False)
++
++
++def digraph_to_superposition_prompt(
++    digraph: nx.DiGraph,
++    max_length: int = 2048,
++    dtype=torch.float32,
++    causal_mask_fn: Callable[[nx.DiGraph], torch.Tensor] = compute_causal_mask_brute_force,
++    position_assignment_fn: Callable[[nx.DiGraph], torch.Tensor] = get_position_ids_from_nested_digraph,
++) -> SuperpositionPrompt:
++    total_nodes = digraph_total_nodes(digraph)
++    if max_length < total_nodes:
++        raise ValueError(f"Max length was too small to accomodate all input ids: {max_length} vs. {total_nodes}")
++
++    causal_mask_inv = causal_mask_fn(digraph)
++    device = causal_mask_inv.device
++
++    overall_causal_mask_inv = torch.tril(
++        torch.ones((max_length, max_length), dtype=causal_mask_inv.dtype, device=device)
++    )
++    rlim, clim = causal_mask_inv.shape
++    assert rlim == clim
++    overall_causal_mask_inv[:rlim, :clim] = causal_mask_inv
++
++    neg_inf = torch.finfo(dtype).min
++    overall_causal_mask = (1 - overall_causal_mask_inv.to(dtype)) * neg_inf
++
++    leading_position_ids = position_assignment_fn(digraph).to(device)
++    assert leading_position_ids.numel() == digraph_total_nodes(digraph)
++
++    remaining_positions = max_length - leading_position_ids.numel()
++    last_pos = leading_position_ids.max().item()
++    remaining_position_ids = torch.tensor(
++        [i + last_pos + 1 for i in range(remaining_positions)], dtype=leading_position_ids.dtype, device=device
++    )
++    position_ids = torch.cat([leading_position_ids, remaining_position_ids], dim=0)
++
++    def _serialize_node_idx(node_idx, _node_data):
++        return node_idx
++
++    def _serialize_input_ids(_node_idx, node_data):
++        return node_data["payload"].input_id
++
++    # Input ids
++    recursively_lex_topo_sorted_input_ids = torch.stack(
++        list(lex_topo_digraph_traversal(digraph, _serialize_input_ids))
++    )
++
++    # Node idxs
++    recursively_lex_topo_sorted_node_idxs = list(lex_topo_digraph_traversal(digraph, _serialize_node_idx))
++    node_idx_map = {node_idx: i for i, node_idx in enumerate(recursively_lex_topo_sorted_node_idxs)}
++    assert len(node_idx_map) == len(
++        recursively_lex_topo_sorted_node_idxs
++    ), f"May be duplicates in leaf node node_idxs: {recursively_lex_topo_sorted_node_idxs}"
++
++    return SuperpositionPrompt(
++        input_ids=recursively_lex_topo_sorted_input_ids.unsqueeze(0),
++        position_ids=position_ids.unsqueeze(0),
++        attention_logit_biases=overall_causal_mask.unsqueeze(0),
++        node_idx_map=node_idx_map,
++        _digraph=digraph,
++    )
++
++
++def average_subgraph_log_likelihood_path_graph(
++    path_digraph,
++    logits,
++    token_decode_temperature: float = 1.0,
++):
++    assert logits.ndim == 2
++    assert digraph_is_path_graph(path_digraph)
++    subgraph_nodes = list(nx.lexicographical_topological_sort(path_digraph))
++    path_logits = logits[subgraph_nodes]
++    downstream_targets = torch.stack([n[1]["payload"].input_id for n in path_digraph.nodes(data=True)]).long()
++
++    # Need to shift logits and downstream targets.
++    downstream_log_probabilities = -F.nll_loss(
++        F.log_softmax(path_logits[:-1] / token_decode_temperature, dim=-1), downstream_targets[1:], reduction="mean"
++    )
++    return downstream_log_probabilities
+diff --git a/src/transformers/prompting/superposition/forkjoin.py b/src/transformers/prompting/superposition/forkjoin.py
+new file mode 100644
+index 000000000..dac2931a5
+--- /dev/null
++++ b/src/transformers/prompting/superposition/forkjoin.py
+@@ -0,0 +1,574 @@
++import copy
++from dataclasses import asdict, dataclass, replace
++from typing import Callable, Iterable, List, Optional, Tuple
++
++import networkx as nx
++import torch
++
++from transformers.prompting.superposition.core import *
++
++
++@dataclass
++class ForkjoinDigraphs:
++    preamble_digraph: nx.DiGraph
++    context_digraphs: Tuple[nx.DiGraph]
++    query_digraphs: Tuple[nx.DiGraph]
++    task_digraph: nx.DiGraph
++
++
++@dataclass
++class ForkjoinInputIds:
++    preamble_input_ids: torch.Tensor
++    context_input_ids_list: List[torch.Tensor]
++    query_input_ids: torch.Tensor
++    task_input_ids: torch.Tensor
++
++    def to_forkjoin_digraphs(self) -> ForkjoinDigraphs:
++        return forkjoin_prompt_as_digraphs(**asdict(self))
++
++
++@dataclass
++class ForkjoinPositionIds:
++    preamble: torch.Tensor
++    contexts: List[torch.Tensor]
++    queries: torch.Tensor
++    task: torch.Tensor
++
++
++def rounded_equilibrium_from_forkjoin_digraphs(forkjoin_digraphs) -> ForkjoinPositionIds:
++    raw_pos = equilibrium_from_forkjoin_digraphs(forkjoin_digraphs)
++    return ForkjoinPositionIds(
++        preamble=raw_pos.preamble.round(),
++        contexts=[p.round() for p in raw_pos.contexts],
++        queries=[q.round().round() for q in raw_pos.queries],
++        task=raw_pos.task.round(),
++    )
++
++
++def compute_parallel_position_spacings(path_lengths: torch.Tensor) -> torch.Tensor:
++    assert path_lengths.ndim == 1
++    length = path_lengths.numel() / (path_lengths.reciprocal()).sum()
++    return length / path_lengths
++
++
++def equilibrium_from_forkjoin_digraphs(forkjoin_digraphs) -> ForkjoinPositionIds:
++    preamble_len = digraph_total_nodes(forkjoin_digraphs.preamble_digraph)
++    preamble_position_ids = 1.0 * torch.arange(0, preamble_len)
++    path_lengths = [digraph_total_nodes(d) for d in forkjoin_digraphs.context_digraphs]
++
++    spacings = compute_parallel_position_spacings(torch.tensor(path_lengths))
++    path_positions = [
++        spacing * torch.arange(0, path_length) + preamble_position_ids.max() + 1
++        for spacing, path_length in zip(spacings, path_lengths)
++    ]
++
++    query_starting_positions = [p[-1] + spacings[i] for i, p in enumerate(path_positions)]
++    assert torch.allclose(query_starting_positions[0], torch.tensor(query_starting_positions))
++    query_starting_position = query_starting_positions[0]
++    query_length = digraph_total_nodes(forkjoin_digraphs.query_digraphs[0])
++    query_positions = [1.0 * torch.arange(0, query_length) + query_starting_position] * len(
++        forkjoin_digraphs.query_digraphs
++    )
++
++    task_length = digraph_total_nodes(forkjoin_digraphs.task_digraph)
++    task_positions = torch.arange(0, task_length, dtype=torch.float32) + 1 + query_positions[0].max()
++    return ForkjoinPositionIds(
++        preamble=preamble_position_ids,
++        contexts=path_positions,
++        queries=query_positions,
++        task=task_positions,
++    )
++
++
++def max_from_forkjoin_digraphs(forkjoin_digraphs) -> ForkjoinPositionIds:
++    preamble_len = digraph_total_nodes(forkjoin_digraphs.preamble_digraph)
++    preamble_position_ids = 1.0 * torch.arange(0, preamble_len)
++    path_lengths = [digraph_total_nodes(d) for d in forkjoin_digraphs.context_digraphs]
++
++    path_positions = [torch.arange(0, path_length) + preamble_position_ids.max() + 1 for path_length in path_lengths]
++    query_length = digraph_total_nodes(forkjoin_digraphs.query_digraphs[0])
++    max_pos = max([p[-1].item() for p in path_positions])
++
++    query_positions = [1.0 * torch.arange(0, query_length) + max_pos + 1] * len(forkjoin_digraphs.query_digraphs)
++    task_length = digraph_total_nodes(forkjoin_digraphs.task_digraph)
++    task_positions = torch.arange(0, task_length, dtype=torch.float32) + 1 + query_positions[0].max()
++    return ForkjoinPositionIds(
++        preamble=preamble_position_ids,
++        contexts=path_positions,
++        queries=query_positions,
++        task=task_positions,
++    )
++
++
++def forkjoin_prompt_as_nested_digraph(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    forkjoin_position_fn: Callable[[ForkjoinDigraphs], ForkjoinPositionIds] = equilibrium_from_forkjoin_digraphs,
++) -> nx.DiGraph:
++    assert len(forkjoin_digraphs.context_digraphs) == len(forkjoin_digraphs.query_digraphs)
++    assert digraph_is_auto_wireable(forkjoin_digraphs.preamble_digraph)
++
++    forkjoin_positions = forkjoin_position_fn(forkjoin_digraphs)
++
++    cur = 0
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(
++        cur,
++        payload=NestedNodePayload(subgraph=forkjoin_digraphs.preamble_digraph),
++        position_ids=NodePosition(forkjoin_positions.preamble),
++    )
++    query_end_node_idxs = []
++
++    for context_digraph, query_digraph, path_position, query_position in zip(
++        forkjoin_digraphs.context_digraphs,
++        forkjoin_digraphs.query_digraphs,
++        forkjoin_positions.contexts,
++        forkjoin_positions.queries,
++    ):
++        assert digraph_is_auto_wireable(context_digraph)
++        assert digraph_is_auto_wireable(query_digraph)
++
++        cur += 1
++        nested_digraph.add_node(
++            cur, payload=NestedNodePayload(subgraph=context_digraph), position_ids=NodePosition(path_position)
++        )
++        nested_digraph.add_edge(0, cur)
++
++        cur += 1
++        nested_digraph.add_node(
++            cur, payload=NestedNodePayload(subgraph=query_digraph), position_ids=NodePosition(query_position)
++        )
++        nested_digraph.add_edge(cur - 1, cur)
++        query_end_node_idxs.append(cur)
++
++    assert digraph_is_auto_wireable(forkjoin_digraphs.task_digraph)
++    cur += 1
++    nested_digraph.add_node(
++        cur,
++        payload=NestedNodePayload(subgraph=forkjoin_digraphs.task_digraph),
++        position_ids=NodePosition(forkjoin_positions.task),
++    )
++    for query_node_end_idx in query_end_node_idxs:
++        nested_digraph.add_edge(query_node_end_idx, cur)
++
++    return nested_digraph
++
++
++def forkjoin_prompt_as_digraphs(
++    preamble_input_ids: Optional[torch.Tensor] = None,
++    context_input_ids_list: Optional[List[torch.Tensor]] = None,
++    query_input_ids: Optional[torch.Tensor] = None,
++    task_input_ids: Optional[torch.Tensor] = None,
++) -> ForkjoinDigraphs:
++    preamble_digraph = phrase_as_path_digraph(preamble_input_ids, 0)
++    cur_max_node_idx = max(preamble_digraph.nodes()) + 1
++
++    context_digraphs = []
++    query_digraphs = []
++    for context_input_ids in context_input_ids_list:
++        # Build context digraph.
++        context_digraph = phrase_as_path_digraph(context_input_ids, cur_max_node_idx)
++        cur_max_node_idx = max(context_digraph.nodes()) + 1
++        context_digraphs.append(context_digraph)
++
++        # Build query digraph.
++        query_digraph = phrase_as_path_digraph(query_input_ids, cur_max_node_idx)
++        cur_max_node_idx = max(query_digraph.nodes()) + 1
++        query_digraphs.append(query_digraph)
++
++    task_digraph = phrase_as_path_digraph(task_input_ids, cur_max_node_idx)
++    return ForkjoinDigraphs(
++        preamble_digraph,
++        context_digraphs,
++        query_digraphs,
++        task_digraph,
++    )
++
++
++def prefix_position_ids_from_branch_selections(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    forkjoin_superposition_prompt: SuperpositionPrompt,
++    selection_idxs: Iterable[int],
++):
++    if len(selection_idxs) > 1:
++        raise NotImplementedError(
++            "Technically this function will work but downstream usage of the output needs to be thought out."
++        )
++
++    # Assert all idxs in range.
++    assert all(selection_idx in range(len(forkjoin_digraphs.context_digraphs)) for selection_idx in selection_idxs)
++
++    # Assert all idxs are unique.
++    assert len(set(selection_idxs)) == len(selection_idxs)
++
++    assert forkjoin_superposition_prompt.position_ids.ndim == 2
++    assert forkjoin_superposition_prompt.position_ids.shape[0] == 1
++
++    res_position_ids_list = []
++
++    for selection_idx in selection_idxs:
++        context_digraph = forkjoin_digraphs.context_digraphs[selection_idx]
++        branch_idx_to_document_node_idxs = list(context_digraph.nodes())
++
++        # Assert all idxs are increasing as they're retrieved.
++        assert sorted(branch_idx_to_document_node_idxs) == branch_idx_to_document_node_idxs
++        selected_position_ids = forkjoin_superposition_prompt.position_ids[:, branch_idx_to_document_node_idxs]
++        res_position_ids_list.append(selected_position_ids)
++
++    preamble_len = len(forkjoin_digraphs.preamble_digraph)
++    preamble_position_ids = forkjoin_superposition_prompt.position_ids[:, :preamble_len]
++
++    return torch.cat([preamble_position_ids] + res_position_ids_list, dim=-1)
++
++
++def update_superposition_prompt_with_position_id_range(superposition_prompt, new_position_ids):
++    """
++    NOTE: This is a *stateful* operation.
++    """
++    assert superposition_prompt.position_ids.ndim == 2
++    assert superposition_prompt.position_ids.shape[0] == 1
++    assert new_position_ids.ndim == 2
++    assert new_position_ids.shape[0] == 1
++
++    assert 0 < new_position_ids.shape[-1] < superposition_prompt.position_ids.shape[-1]
++
++    update_end_idx = new_position_ids.shape[-1]
++    superposition_prompt.position_ids[:, :update_end_idx] = new_position_ids
++
++    subsequent_position_ids = superposition_prompt.position_ids[:, update_end_idx:]
++    zeroed_subsequent_position_ids = subsequent_position_ids - subsequent_position_ids.min()
++    superposition_prompt.position_ids[:, update_end_idx:] = (
++        zeroed_subsequent_position_ids + 1 + new_position_ids.max().item()
++    )
++
++    return superposition_prompt
++
++
++def push_branch_to_preamble(forkjoin_input_ids: ForkjoinInputIds, idx) -> ForkjoinInputIds:
++    context_list_copy = list(forkjoin_input_ids.context_input_ids_list)
++    popped_context = context_list_copy.pop(idx)
++    new_preamble_input_ids = torch.cat([forkjoin_input_ids.preamble_input_ids, popped_context], dim=-1)
++    return replace(
++        forkjoin_input_ids, preamble_input_ids=new_preamble_input_ids, context_input_ids_list=context_list_copy
++    )
++
++
++###############
++# ATTENUATION #
++###############
++
++
++@dataclass
++class ForkjoinLogLikelihoods:
++    documents: torch.Tensor
++    queries: torch.Tensor
++    document_likelihood_mixing_weight: float = 1.0
++
++    @property
++    def branches(self) -> torch.Tensor:
++        return self.queries + self.document_likelihood_mixing_weight * self.documents
++
++
++def _attenuate_superposition_prompt(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    branch_weights: torch.Tensor,
++    superposition_prompt: SuperpositionPrompt,
++    forkjoin_temperature: Optional[float],
++    forkjoin_topk: Optional[int],
++    topk_normalize: bool = False,
++) -> Tuple[SuperpositionPrompt, torch.Tensor]:
++    """
++    NOTE: This is a *stateful* operation.
++    """
++    original_dtype = branch_weights.dtype
++    assert forkjoin_temperature is not None or forkjoin_topk is not None
++
++    # Start high precision computation.
++    branch_weights = branch_weights.clone().float()
++    assert branch_weights.ndim == 1
++    n_branches = branch_weights.shape[0]
++
++    branches_log_prob = torch.zeros_like(branch_weights)
++
++    if forkjoin_topk is not None:
++        if topk_normalize:
++            branches_log_prob -= torch.log(torch.tensor(forkjoin_topk))
++        topk_weights = torch.zeros_like(branch_weights)
++        assert 1 <= forkjoin_topk <= n_branches
++        prune_indices = torch.topk(branch_weights, largest=False, k=n_branches - forkjoin_topk).indices
++        topk_weights[prune_indices] = torch.finfo(branch_weights.dtype).min
++        branches_log_prob += topk_weights
++
++    if forkjoin_temperature is not None:
++        branch_probabilities = torch.softmax(branch_weights / forkjoin_temperature, dim=0)
++        assert torch.all(torch.isfinite(branch_probabilities)), f"Bad probability vector: {branch_probabilities}"
++        total_branch_probability = branch_probabilities.sum()
++        assert torch.allclose(total_branch_probability, total_branch_probability.new_ones((1,)), atol=0.01)
++        branches_log_prob += torch.log(branch_probabilities).to(dtype=original_dtype)
++
++    # End high precision computation.
++
++    branches_log_prob_zeroed = branches_log_prob - branches_log_prob.max()
++
++    task_start = min([superposition_prompt.node_idx_map[node_idx] for node_idx in forkjoin_digraphs.task_digraph])
++
++    for branch_num, branch_log_prob_zeroed in enumerate(branches_log_prob_zeroed):
++        context_branch_arr_idxs = [
++            superposition_prompt.node_idx_map[node_idx] for node_idx in forkjoin_digraphs.context_digraphs[branch_num]
++        ]
++        query_branch_arr_idxs = [
++            superposition_prompt.node_idx_map[node_idx] for node_idx in forkjoin_digraphs.query_digraphs[branch_num]
++        ]
++        branch_all_arr_idxs = context_branch_arr_idxs + query_branch_arr_idxs
++
++        assert torch.all(superposition_prompt.attention_logit_biases[:, task_start:, branch_all_arr_idxs] > -1)
++        assert torch.all(
++            superposition_prompt.attention_logit_biases[:, task_start:, branch_all_arr_idxs]
++            == superposition_prompt.attention_logit_biases[0, task_start, branch_all_arr_idxs[0]]
++        )
++        assert superposition_prompt.attention_logit_biases[:, task_start:, branch_all_arr_idxs].numel() > 0
++        superposition_prompt.attention_logit_biases[0, task_start:, branch_all_arr_idxs] += branch_log_prob_zeroed
++    return superposition_prompt, torch.exp(branches_log_prob).to(dtype=original_dtype)
++
++
++def random_branch_weights(forkjoin_digraphs: ForkjoinDigraphs):
++    n_branches = len(forkjoin_digraphs.context_digraphs)
++    branch_weights = torch.rand(n_branches)
++    return branch_weights
++
++
++def random_attenuate_forkjoin_branches(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    superposition_prompt: SuperpositionPrompt,
++    forkjoin_temperature: float = 0.1,
++    forkjoin_topk: Optional[int] = None,
++    topk_normalize: bool = False,
++) -> Tuple[SuperpositionPrompt, torch.Tensor]:
++    superposition_prompt = copy.deepcopy(superposition_prompt)
++
++    branch_weights = random_branch_weights(forkjoin_digraphs)
++    superposition_prompt, branch_probabilities = _attenuate_superposition_prompt(
++        forkjoin_digraphs,
++        branch_weights,
++        superposition_prompt,
++        forkjoin_temperature=forkjoin_temperature,
++        forkjoin_topk=forkjoin_topk,
++        topk_normalize=topk_normalize,
++    )
++    return superposition_prompt, branch_probabilities
++
++
++def attention_branch_weights(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    reduced_attentions: torch.Tensor,
++):
++    assert reduced_attentions.ndim == 2
++    n_branches = len(forkjoin_digraphs.context_digraphs)
++    branch_idx_to_document_node_idxs = [
++        list(forkjoin_digraph.nodes()) for forkjoin_digraph in forkjoin_digraphs.context_digraphs
++    ]
++    branch_idx_to_query_node_idxs = [
++        list(forkjoin_digraph.nodes()) for forkjoin_digraph in forkjoin_digraphs.query_digraphs
++    ]
++
++    branch_weights = reduced_attentions.new_zeros(n_branches)
++    for branch_idx, (document_node_idxs, query_node_idxs) in enumerate(
++        zip(
++            branch_idx_to_document_node_idxs,
++            branch_idx_to_query_node_idxs,
++        )
++    ):
++        didxs = torch.tensor(document_node_idxs)
++        qidxs = torch.tensor(query_node_idxs)
++
++        dd, qq = torch.meshgrid(didxs, qidxs, indexing="ij")
++        branch_attentions = reduced_attentions[qq, dd].sum()
++        branch_weights[branch_idx] = branch_attentions
++        assert torch.any(branch_attentions.gt(branch_attentions.new_zeros(())))
++    assert torch.all(torch.isfinite(branch_weights))
++    return branch_weights
++
++
++def attention_attenuate_forkjoin_branches(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    reduced_attentions: torch.Tensor,
++    superposition_prompt: SuperpositionPrompt,
++    forkjoin_temperature: float = 0.1,
++    forkjoin_topk: Optional[int] = None,
++    topk_normalize: bool = False,
++) -> Tuple[SuperpositionPrompt, torch.Tensor]:
++    superposition_prompt = copy.deepcopy(superposition_prompt)
++
++    # assert all(layer_attentions.shape[0] == 1 for layer_attentions in reduced_attentions)
++    if superposition_prompt.node_idx_map is not None:
++        node_map = superposition_prompt.node_idx_map
++        assert all(k == v for k, v in node_map.items())
++
++    branch_weights = attention_branch_weights(forkjoin_digraphs, reduced_attentions)
++    superposition_prompt, branch_probabilities = _attenuate_superposition_prompt(
++        forkjoin_digraphs,
++        branch_weights,
++        superposition_prompt,
++        topk_normalize=topk_normalize,
++        forkjoin_temperature=forkjoin_temperature,
++        forkjoin_topk=forkjoin_topk,
++    )
++    return superposition_prompt, branch_probabilities
++
++
++def bayesian_branch_weights(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    logits: torch.Tensor,
++    token_decode_temperature: float = 1.0,
++    document_likelihood_mixing_weight=1.0,
++):
++    assert logits.ndim == 3
++    assert logits.shape[0] == 1
++    logits = logits[0]
++
++    document_log_likelihoods_list = []
++    query_log_likelihoods_list = []
++    for document_digraph, query_digraph in zip(forkjoin_digraphs.context_digraphs, forkjoin_digraphs.query_digraphs):
++        document_log_likelihoods_list.append(
++            average_subgraph_log_likelihood_path_graph(
++                document_digraph, logits, token_decode_temperature=token_decode_temperature
++            )
++        )
++        query_log_likelihoods_list.append(
++            average_subgraph_log_likelihood_path_graph(
++                query_digraph, logits, token_decode_temperature=token_decode_temperature
++            )
++        )
++
++    query_log_likelihoods = torch.stack(query_log_likelihoods_list).detach()
++    document_log_likelihoods = torch.stack(document_log_likelihoods_list).detach()
++    forkjoin_log_likelihoods = ForkjoinLogLikelihoods(
++        documents=document_log_likelihoods,
++        queries=query_log_likelihoods,
++        document_likelihood_mixing_weight=document_likelihood_mixing_weight,
++    )
++    return forkjoin_log_likelihoods
++
++
++def bayesian_attenuate_forkjoin_branches(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    superposition_prompt: SuperpositionPrompt,
++    logits: torch.Tensor,
++    token_decode_temperature: float = 1.0,
++    document_likelihood_mixing_weight=1.0,
++    forkjoin_temperature: float = 0.1,
++    forkjoin_topk: Optional[int] = None,
++    topk_normalize: bool = False,
++) -> Tuple[SuperpositionPrompt, ForkjoinLogLikelihoods]:
++    superposition_prompt = copy.deepcopy(superposition_prompt)
++    assert logits.ndim == 3 and logits.shape[0] == 1
++
++    forkjoin_log_likelihoods = bayesian_branch_weights(
++        forkjoin_digraphs,
++        logits,
++        token_decode_temperature,
++        document_likelihood_mixing_weight,
++    )
++
++    superposition_prompt, _ = _attenuate_superposition_prompt(
++        forkjoin_digraphs,
++        forkjoin_log_likelihoods.branches,
++        superposition_prompt,
++        forkjoin_temperature=forkjoin_temperature,
++        forkjoin_topk=forkjoin_topk,
++        topk_normalize=topk_normalize,
++    )
++
++    return superposition_prompt, forkjoin_log_likelihoods
++
++
++################
++# PROMPT CACHE #
++################
++
++
++def prompt_cache_prompt_as_digraphs(
++    preamble_input_ids: Optional[torch.Tensor] = None,
++    context_input_ids_list: Optional[List[torch.Tensor]] = None,
++    query_input_ids: Optional[torch.Tensor] = None,
++    task_input_ids: Optional[torch.Tensor] = None,
++) -> ForkjoinDigraphs:
++    preamble_digraph = phrase_as_path_digraph(preamble_input_ids, 0)
++    cur_max_node_idx = max(preamble_digraph.nodes()) + 1
++
++    context_digraphs = []
++    for context_input_ids in context_input_ids_list:
++        # Build context digraph.
++        context_digraph = phrase_as_path_digraph(context_input_ids, cur_max_node_idx)
++        cur_max_node_idx = max(context_digraph.nodes()) + 1
++        context_digraphs.append(context_digraph)
++
++    # Build query digraph.
++    query_digraph = phrase_as_path_digraph(query_input_ids, cur_max_node_idx)
++    cur_max_node_idx = max(query_digraph.nodes()) + 1
++    query_digraphs = [query_digraph]
++
++    task_digraph = phrase_as_path_digraph(task_input_ids, cur_max_node_idx)
++    return ForkjoinDigraphs(
++        preamble_digraph,
++        context_digraphs,
++        query_digraphs,
++        task_digraph,
++    )
++
++
++def prompt_cache_prompt_as_nested_digraph(
++    forkjoin_digraphs: ForkjoinDigraphs,
++    forkjoin_position_fn: Callable[[ForkjoinDigraphs], ForkjoinPositionIds] = max_from_forkjoin_digraphs,
++) -> nx.DiGraph:
++    assert forkjoin_position_fn == max_from_forkjoin_digraphs
++    assert len(forkjoin_digraphs.context_digraphs) > 1
++    assert len(forkjoin_digraphs.query_digraphs) == 1
++    assert digraph_is_auto_wireable(forkjoin_digraphs.preamble_digraph)
++
++    forkjoin_positions = forkjoin_position_fn(forkjoin_digraphs)
++
++    cur = 0
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(
++        cur,
++        payload=NestedNodePayload(subgraph=forkjoin_digraphs.preamble_digraph),
++        position_ids=NodePosition(forkjoin_positions.preamble),
++    )
++
++    context_node_idxs = []
++    for context_digraph, path_position in zip(forkjoin_digraphs.context_digraphs, forkjoin_positions.contexts):
++        assert digraph_is_auto_wireable(context_digraph)
++
++        cur += 1
++        context_node_idxs.append(cur)
++        nested_digraph.add_node(
++            cur, payload=NestedNodePayload(subgraph=context_digraph), position_ids=NodePosition(path_position)
++        )
++
++    query_digraph = forkjoin_digraphs.query_digraphs[0]
++    assert len(forkjoin_positions.queries) == 1
++    query_position = forkjoin_positions.queries[0]
++    cur += 1
++    query_node_idx = cur
++    nested_digraph.add_node(
++        cur, payload=NestedNodePayload(subgraph=query_digraph), position_ids=NodePosition(query_position)
++    )
++
++    nested_digraph.add_edge(0, query_node_idx)
++    for context_node_idx in context_node_idxs:
++        nested_digraph.add_edge(context_node_idx, query_node_idx)
++
++    assert digraph_is_auto_wireable(forkjoin_digraphs.task_digraph)
++    cur += 1
++    nested_digraph.add_node(
++        cur,
++        payload=NestedNodePayload(subgraph=forkjoin_digraphs.task_digraph),
++        position_ids=NodePosition(forkjoin_positions.task),
++    )
++
++    nested_digraph.add_edge(0, cur)
++    nested_digraph.add_edge(query_node_idx, cur)
++    for context_node_idx in context_node_idxs:
++        nested_digraph.add_edge(context_node_idx, cur)
++
++    return nested_digraph
+diff --git a/src/transformers/testing_utils.py b/src/transformers/testing_utils.py
+index 4dcca595a..326dbae04 100644
+--- a/src/transformers/testing_utils.py
++++ b/src/transformers/testing_utils.py
+@@ -133,7 +133,7 @@ if is_pytest_available():
+         _is_mocked,
+         _patch_unwrap_mock_aware,
+         get_optionflags,
+-        import_path,
++        # import_path,
+     )
+     from _pytest.outcomes import skip
+     from pytest import DoctestItem
+diff --git a/src/transformers/utils/import_utils.py b/src/transformers/utils/import_utils.py
+index 9f3b6865a..be55e85e8 100644
+--- a/src/transformers/utils/import_utils.py
++++ b/src/transformers/utils/import_utils.py
+@@ -733,7 +733,7 @@ def is_vision_available():
+             except importlib.metadata.PackageNotFoundError:
+                 return False
+         logger.debug(f"Detected PIL version {package_version}")
+-    return _pil_available
++    return False
+ 
+ 
+ def is_pytesseract_available():
+diff --git a/tests/models/bloom/test_modeling_bloom.py b/tests/models/bloom/test_modeling_bloom.py
+index 95160179c..7ce3d5493 100644
+--- a/tests/models/bloom/test_modeling_bloom.py
++++ b/tests/models/bloom/test_modeling_bloom.py
+@@ -19,13 +19,27 @@ import unittest
+ 
+ from transformers import BloomConfig, is_torch_available
+ from transformers.testing_utils import require_torch, require_torch_accelerator, slow, torch_device
++from transformers.prompting.superposition.core import (
++    digraph_to_superposition_prompt,
++    flatten_nested_digraph,
++    digraph_total_nodes,
++)
++from transformers.prompting.superposition.forkjoin import (
++    forkjoin_prompt_as_digraphs,
++    forkjoin_prompt_as_nested_digraph,
++)
+ 
+ from ...generation.test_utils import GenerationTesterMixin
+ from ...test_configuration_common import ConfigTester
+-from ...test_modeling_common import ModelTesterMixin, ids_tensor, random_attention_mask
++from ...test_modeling_common import ModelTesterMixin, create_forkjoin_prompt_with_extras, ids_tensor, random_attention_mask
+ from ...test_pipeline_mixin import PipelineTesterMixin
+ 
+ 
++def _dummy_position_assignment_fn(digraph):
++    size = digraph_total_nodes(digraph)
++    return torch.arange(size)
++
++
+ if is_torch_available():
+     import torch
+ 
+@@ -439,6 +453,52 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
+ 
+         self.assertEqual(tokenizer.decode(greedy_output[0], skip_special_tokens=True), EXPECTED_OUTPUT)
+ 
++    @staticmethod
++    def _actual_superposition_inputs(tokenizer: BloomTokenizerFast):
++        def encode_text(text: str) -> torch.Tensor:
++            return torch.as_tensor([tokenizer.encode(text, add_special_tokens=False)], dtype=torch.int32)
++
++        forkjoin_digraphs = create_forkjoin_prompt_with_extras(tokenizer.vocab_size)[1]
++        nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++
++        flattened_digraph = flatten_nested_digraph(nested_digraph)
++        actual_superposition_prompt = digraph_to_superposition_prompt(flattened_digraph, position_assignment_fn=_dummy_position_assignment_fn)
++        return forkjoin_digraphs, nested_digraph, actual_superposition_prompt
++
++    @classmethod
++    def _actual_superposition_prompt(cls, tokenizer: BloomTokenizerFast):
++        return cls._actual_superposition_inputs(tokenizer)[-1]
++
++    @require_torch_accelerator
++    def test_simple_superposition_generation_extended(self):
++        path_560m = "bigscience/bloom-560m"
++        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").cuda()
++        model = model.eval()
++        tokenizer = BloomTokenizerFast.from_pretrained(path_560m)
++
++        actual_superposition_prompt = self._actual_superposition_prompt(tokenizer)
++        past_key_values = model.superposition_forward(actual_superposition_prompt).past_key_values
++
++        extension_text = "Extension"
++        extension_tensor = actual_superposition_prompt.input_ids.new_tensor(
++            tokenizer.encode(extension_text, add_special_tokens=False)
++        ).reshape(1, -1)
++        actual_superposition_prompt_extended = actual_superposition_prompt.extend(extension_tensor)
++
++        greedy_output = model.superposition_prompt_generate(
++            actual_superposition_prompt_extended, past_key_values=past_key_values, max_new_tokens=20
++        )
++
++    @require_torch_accelerator
++    def test_simple_superposition_generation(self):
++        path_560m = "bigscience/bloom-560m"
++        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").cuda()
++        model = model.eval()
++        tokenizer = BloomTokenizerFast.from_pretrained(path_560m)
++
++        actual_superposition_prompt = self._actual_superposition_prompt(tokenizer)
++        greedy_output = model.superposition_prompt_generate(actual_superposition_prompt, max_new_tokens=20)
++
+     @slow
+     @require_torch_accelerator
+     def test_batch_generation(self):
+diff --git a/tests/models/llama/test_modeling_llama.py b/tests/models/llama/test_modeling_llama.py
+index 427f94f87..d9206d517 100644
+--- a/tests/models/llama/test_modeling_llama.py
++++ b/tests/models/llama/test_modeling_llama.py
+@@ -12,7 +12,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-""" Testing suite for the PyTorch LLaMA model. """
++"""Testing suite for the PyTorch LLaMA model."""
+ 
+ import tempfile
+ import unittest
+@@ -31,10 +31,18 @@ from transformers.testing_utils import (
+     slow,
+     torch_device,
+ )
++from transformers.prompting.superposition.core import (
++    visualize,
++)
+ 
+ from ...generation.test_utils import GenerationTesterMixin
+ from ...test_configuration_common import ConfigTester
+-from ...test_modeling_common import ModelTesterMixin, ids_tensor
++from ...test_modeling_common import (
++    ModelTesterMixin,
++    create_forkjoin_prompt,
++    create_forkjoin_prompt_with_extras,
++    ids_tensor,
++)
+ from ...test_pipeline_mixin import PipelineTesterMixin
+ 
+ 
+@@ -350,7 +358,48 @@ class LlamaModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
+         result = model(input_ids, attention_mask=attention_mask, labels=sequence_labels)
+         self.assertEqual(result.logits.shape, (self.model_tester.batch_size, self.model_tester.num_labels))
+ 
+-    @unittest.skip("Llama buffers include complex numbers, which breaks this test")
++    def test_simple_superposition_generation_extended(self):
++        config, input_dict = self.model_tester.prepare_config_and_inputs_for_common()
++        config._attn_implementation = "eager"
++        model = LlamaForCausalLM(config=config)
++        model.to(torch_device)
++        model.eval()
++        model = model.eval()
++
++        actual_superposition_prompt = create_forkjoin_prompt(self.model_tester.vocab_size, max_size=200)
++        past_key_values = model.superposition_forward(
++            actual_superposition_prompt, shift_labels=False
++        ).past_key_values
++
++        extension_tensor = actual_superposition_prompt.input_ids.new_tensor(
++            ids_tensor([1, 14], self.model_tester.vocab_size)
++        ).reshape(1, -1)
++        actual_superposition_prompt_extended = actual_superposition_prompt.extend(extension_tensor)
++        greedy_output = model.superposition_prompt_generate(
++            actual_superposition_prompt_extended, past_key_values=past_key_values, max_new_tokens=20
++        )
++
++    def test_visualize_superposition_prompt(self):
++        (
++            superposition_prompt,
++            _,
++            nested_digraph,
++            flattened_digraph,
++        ) = create_forkjoin_prompt_with_extras(self.model_tester.vocab_size, max_size=200)
++
++        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
++        model = LlamaForCausalLM(config=config)
++        model.to(torch_device)
++        model.eval()
++        model = model.eval()
++
++        forward_result = model.superposition_forward(superposition_prompt, shift_labels=False)
++        from transformers import AutoTokenizer
++
++        tokenizer = AutoTokenizer.from_pretrained("bigscience/bloomz-7b1")
++        visualize(nested_digraph, superposition_prompt, tokenizer=tokenizer)
++
++    @unittest.skip("LLaMA buffers include complex numbers, which breaks this test")
+     def test_save_load_fast_init_from_base(self):
+         pass
+ 
+diff --git a/tests/models/mpt/test_modeling_mpt.py b/tests/models/mpt/test_modeling_mpt.py
+index c2d3ae0d0..cc40a826a 100644
+--- a/tests/models/mpt/test_modeling_mpt.py
++++ b/tests/models/mpt/test_modeling_mpt.py
+@@ -19,10 +19,13 @@ import unittest
+ 
+ from transformers import MptConfig, is_torch_available
+ from transformers.testing_utils import require_bitsandbytes, require_torch, require_torch_gpu, slow, torch_device
++from transformers.prompting.superposition.core import (
++    digraph_total_nodes,
++)
+ 
+ from ...generation.test_utils import GenerationTesterMixin
+ from ...test_configuration_common import ConfigTester
+-from ...test_modeling_common import ModelTesterMixin, ids_tensor, random_attention_mask
++from ...test_modeling_common import ModelTesterMixin, create_forkjoin_prompt, ids_tensor, random_attention_mask
+ from ...test_pipeline_mixin import PipelineTesterMixin
+ 
+ 
+@@ -428,6 +431,48 @@ class MptModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin,
+             self.assertIsNotNone(model)
+ 
+ 
++class MptSuperpositionTests(unittest.TestCase):
++    def test_superposition_did_not_break_normal(self):
++        model_id = "yujiepan/mpt-tiny-random"
++        tokenizer = AutoTokenizer.from_pretrained(model_id)
++
++        # model = MptForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
++        model = MptForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
++        model.to(torch_device)
++        config = MptConfig.from_pretrained(model_id)
++
++        tokenizer.pad_token_id = tokenizer.eos_token_id
++        tokenizer.padding_side = "left"
++
++        input_ids = ids_tensor((1, 30), config.vocab_size)
++        model(input_ids)
++
++    def test_simple_superposition_generation_extended(self):
++        model_id = "yujiepan/mpt-tiny-random"
++        tokenizer = AutoTokenizer.from_pretrained(model_id)
++
++        # model = MptForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
++        model = MptForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
++        model.to(torch_device)
++        config = MptConfig.from_pretrained(model_id)
++
++        tokenizer.pad_token_id = tokenizer.eos_token_id
++        tokenizer.padding_side = "left"
++
++        actual_superposition_prompt = create_forkjoin_prompt(config.vocab_size, max_size=200)
++        past_key_values = model.superposition_forward(
++            actual_superposition_prompt, shift_labels=False
++        ).past_key_values
++
++        extension_tensor = actual_superposition_prompt.input_ids.new_tensor(
++            ids_tensor([1, 14], vocab_size=config.vocab_size)
++        ).reshape(1, -1)
++        actual_superposition_prompt_extended = actual_superposition_prompt.extend(extension_tensor)
++        greedy_output = model.superposition_prompt_generate(
++            actual_superposition_prompt_extended, past_key_values=past_key_values, max_new_tokens=20
++        )
++
++
+ @slow
+ @require_torch_gpu
+ @require_bitsandbytes
+diff --git a/tests/prompting/__init__.py b/tests/prompting/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/prompting/superposition/__init__.py b/tests/prompting/superposition/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/tests/prompting/superposition/test_superposition_prompt.py b/tests/prompting/superposition/test_superposition_prompt.py
+new file mode 100644
+index 000000000..1efeb5c5d
+--- /dev/null
++++ b/tests/prompting/superposition/test_superposition_prompt.py
+@@ -0,0 +1,654 @@
++import logging
++from dataclasses import asdict
++from typing import *
++from typing import Iterable, List, Optional, Tuple
++
++import networkx as nx
++import pytest
++import torch
++from torch.nn import functional as F
++
++from transformers.prompting.superposition.core import *
++from transformers.prompting.superposition.forkjoin import *
++from transformers.testing_utils import torch_device
++
++from ...test_modeling_common import create_forkjoin_input_ids
++
++logger = logging.getLogger(__name__)
++
++NEG_INF = -1e15
++
++
++CanoePromptPointers = Tuple[
++    Iterable[int],
++    List[Iterable[int]],
++    Iterable[int],
++]
++
++
++def _dummy_position_assignment_fn(digraph):
++    size = digraph_total_nodes(digraph)
++    return torch.arange(size)
++
++
++def dense_canoe_nested_digraph(
++    preamble_input_ids: Optional[torch.Tensor] = None,
++    context_input_ids_list: Optional[List[torch.Tensor]] = None,
++    task_input_ids: Optional[torch.Tensor] = None,
++) -> nx.DiGraph:
++    preamble_digraph = phrase_as_path_digraph(preamble_input_ids, 0)
++    cur_max_node_idx = max(preamble_digraph.nodes()) + 1
++
++    context_digraphs = []
++    for i in range(2 * len(context_input_ids_list)):
++        # Build context digraph.
++        context_input_ids = context_input_ids_list[i // 2]
++        context_digraph = phrase_as_path_digraph(context_input_ids, cur_max_node_idx)
++        cur_max_node_idx = max(context_digraph.nodes()) + 1
++        context_digraphs.append(context_digraph)
++
++    task_digraph = phrase_as_path_digraph(task_input_ids, cur_max_node_idx)
++
++    assert digraph_is_auto_wireable(preamble_digraph)
++    cur = 0
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=preamble_digraph))
++    context_end_node_idxs_0 = []
++    for i in range(len(context_digraphs) // 2):
++        assert digraph_is_auto_wireable(context_digraph)
++        cur += 1
++        context_digraph = context_digraphs[i]
++        nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=context_digraph))
++        nested_digraph.add_edge(0, cur)
++        context_end_node_idxs_0.append(cur)
++
++    context_end_node_idxs_1 = []
++    for i in range(len(context_digraphs) // 2, len(context_digraphs)):
++        assert digraph_is_auto_wireable(context_digraph)
++        cur += 1
++        context_digraph = context_digraphs[i]
++        nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=context_digraph))
++        for j in context_end_node_idxs_0:
++            nested_digraph.add_edge(j, cur)
++        context_end_node_idxs_1.append(cur)
++
++    assert digraph_is_auto_wireable(task_digraph)
++    cur += 1
++    nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=task_digraph))
++    for context_end_node_idx in context_end_node_idxs_1:
++        nested_digraph.add_edge(context_end_node_idx, cur)
++    return nested_digraph
++
++
++def canoe_digraphs(
++    preamble_digraph: Optional[nx.DiGraph] = None,
++    context_digraphs: Optional[List[nx.DiGraph]] = None,
++    task_digraph: Optional[nx.DiGraph] = None,
++) -> nx.DiGraph:
++    assert digraph_is_auto_wireable(preamble_digraph)
++    cur = 0
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=preamble_digraph))
++    context_end_node_idxs = []
++    for context_digraph in context_digraphs:
++        assert digraph_is_auto_wireable(context_digraph)
++        cur += 1
++        nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=context_digraph))
++        nested_digraph.add_edge(0, cur)
++        context_end_node_idxs.append(cur)
++
++    assert digraph_is_auto_wireable(task_digraph)
++    cur += 1
++    nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=task_digraph))
++    for context_end_node_idx in context_end_node_idxs:
++        nested_digraph.add_edge(context_end_node_idx, cur)
++
++    return nested_digraph
++
++
++def canoe_prompt_as_nested_digraph(
++    preamble_input_ids: Optional[torch.Tensor] = None,
++    context_input_ids_list: Optional[List[torch.Tensor]] = None,
++    task_input_ids: Optional[torch.Tensor] = None,
++) -> Tuple[nx.DiGraph, List[nx.DiGraph], List[nx.DiGraph], nx.DiGraph]:
++    preamble_digraph = phrase_as_path_digraph(preamble_input_ids, 0)
++    cur_max_node_idx = max(preamble_digraph.nodes()) + 1
++
++    context_digraphs = []
++    for context_input_ids in context_input_ids_list:
++        # Build context digraph.
++        context_digraph = phrase_as_path_digraph(context_input_ids, cur_max_node_idx)
++        cur_max_node_idx = max(context_digraph.nodes()) + 1
++        context_digraphs.append(context_digraph)
++
++    task_digraph = phrase_as_path_digraph(task_input_ids, cur_max_node_idx)
++
++    assert digraph_is_auto_wireable(preamble_digraph)
++    cur = 0
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=preamble_digraph))
++    context_end_node_idxs = []
++    for context_digraph in context_digraphs:
++        assert digraph_is_auto_wireable(context_digraph)
++        cur += 1
++        nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=context_digraph))
++        nested_digraph.add_edge(0, cur)
++        context_end_node_idxs.append(cur)
++
++    assert digraph_is_auto_wireable(task_digraph)
++    cur += 1
++    nested_digraph.add_node(cur, payload=NestedNodePayload(subgraph=task_digraph))
++    for context_end_node_idx in context_end_node_idxs:
++        nested_digraph.add_edge(context_end_node_idx, cur)
++
++    return nested_digraph
++
++
++def _canoe_prompt_as_digraph(
++    preamble_input_ids: Optional[torch.Tensor] = None,
++    context_input_ids_list: Optional[List[torch.Tensor]] = None,
++    task_input_ids: Optional[torch.Tensor] = None,
++) -> Tuple[nx.DiGraph, CanoePromptPointers]:
++    preamble_input_ids = preamble_input_ids.squeeze()
++    context_input_ids_list = [context_input_ids.squeeze() for context_input_ids in context_input_ids_list]
++    task_input_ids = task_input_ids.squeeze()
++
++    graph = nx.DiGraph()
++    assert preamble_input_ids.ndim == 1
++    assert preamble_input_ids.numel() > 0
++    assert len(context_input_ids_list) > 0
++    assert all(context_input_ids.numel() > 0 for context_input_ids in context_input_ids_list)
++    assert task_input_ids.numel() > 0
++
++    cur = 0
++
++    # Preamble.
++    for input_id in preamble_input_ids:
++        graph.add_node(cur, input_id=input_id)
++        if cur > 0:
++            graph.add_edge(cur, cur - 1)
++        cur += 1
++    preamble_last_node = cur - 1
++    preamble_span = range(0, preamble_last_node + 1)
++
++    # PCW.
++    last_node_set = set()
++    context_spans = []
++    for context_input_ids in context_input_ids_list:
++        preamble_span_start = cur
++        for i, input_id in enumerate(context_input_ids):
++            graph.add_node(cur, input_id=input_id)
++            if i == 0:
++                graph.add_edge(cur, preamble_last_node)
++            else:
++                graph.add_edge(cur, cur - 1)
++            cur += 1
++        preamble_span_end = cur - 1
++        last_node_set.add(preamble_span_end)
++        context_spans.append(range(preamble_span_start, preamble_span_end + 1))
++
++    # Task.
++    task_span_start = cur
++    for i, input_id in enumerate(task_input_ids):
++        graph.add_node(cur, input_id=input_id)
++        if i == 0:
++            [graph.add_edge(cur, last_node) for last_node in last_node_set]
++        else:
++            graph.add_edge(cur, cur - 1)
++        cur += 1
++    task_span = range(task_span_start, cur - 1 + 1)
++
++    return graph.reverse(), (preamble_span, context_spans, task_span)
++
++
++@pytest.fixture
++def preamble_context_and_task_input_ids(preamble_context_query_and_task_input_ids):
++    preamble_input_ids, context_input_ids_list, _, task_input_ids = preamble_context_query_and_task_input_ids
++    return preamble_input_ids, context_input_ids_list, task_input_ids
++
++
++@pytest.fixture
++def preamble_context_query_and_task_input_ids():
++    return create_forkjoin_input_ids(vocab_size=10)
++
++
++def _manual_canoe_superposition_prompt(
++    preamble_input_ids: Optional[torch.Tensor] = None,
++    context_input_ids_list: Optional[List[torch.Tensor]] = None,
++    task_input_ids: Optional[torch.Tensor] = None,
++    dtype=torch.float32,
++) -> SuperpositionPrompt:
++    all_input_ids = torch.cat([preamble_input_ids] + context_input_ids_list + [task_input_ids], dim=1)
++    preamble_size = preamble_input_ids.shape[-1]
++    context_size_list = [context.shape[-1] for context in context_input_ids_list]
++
++    generate_size = 2048 - all_input_ids.shape[-1]
++
++    task_size = task_input_ids.shape[-1]
++    max_pretext_size = max(context_size_list) + preamble_size
++    task_end_position = max_pretext_size + task_size
++    generation_end_position = task_end_position + generate_size
++
++    preamble_positions = torch.arange(preamble_size)
++    context_positions = [
++        torch.arange(preamble_size, preamble_size + context_size) for context_size in context_size_list
++    ]
++    task_positions = torch.arange(max_pretext_size, task_end_position)
++    generate_positions = torch.arange(task_end_position, generation_end_position)
++    full_positions = torch.cat([preamble_positions] + context_positions + [task_positions, generate_positions])
++
++    def lower_diag_mask(size):
++        return torch.tril(torch.ones((size, size)))
++
++    preamble_mask = lower_diag_mask(preamble_size)
++    context_mask_list = [lower_diag_mask(context_size) for context_size in context_size_list]
++    task_mask = lower_diag_mask(task_size)
++    generate_mask = lower_diag_mask(generate_size)
++
++    prompt_mask = torch.block_diag(*([preamble_mask] + context_mask_list + [task_mask]))
++
++    # Ensure all can attend to premable.
++    prompt_mask[preamble_size:, :preamble_size] = 1
++
++    # Ensure task can attend to all context (and preamble).
++    prompt_mask[-task_size:, :-task_size] = 1
++    prompt_size = prompt_mask.shape[-1]
++
++    full_mask = torch.block_diag(prompt_mask, generate_mask)
++
++    # Ensure generate can attend to preamble, context, and task.
++    full_mask[prompt_size:, :prompt_size] = 1
++
++    neg_inf = torch.finfo(dtype).min
++    attention_logit_biases = (1 - full_mask).to(dtype) * neg_inf
++
++    return SuperpositionPrompt(
++        input_ids=all_input_ids,
++        position_ids=full_positions.unsqueeze(0),
++        attention_logit_biases=attention_logit_biases.unsqueeze(0),
++        node_idx_map=None,
++        _digraph=None,
++    )
++
++
++def assert_equal(expected_superposition_prompt, actual_superposition_prompt):
++    actual_superposition_prompt_dict = asdict(actual_superposition_prompt)
++    expected_superposition_prompt_dict = asdict(expected_superposition_prompt)
++
++    for k in asdict(actual_superposition_prompt).keys():
++        print(f"testing: {k}")
++        if isinstance(expected_superposition_prompt_dict[k], torch.Tensor):
++            expected = expected_superposition_prompt_dict[k]
++            actual_dtype = actual_superposition_prompt_dict[k].dtype
++            if k == "position_ids" and actual_dtype.is_floating_point:
++                expected = expected.to(actual_dtype)
++            assert torch.allclose(actual_superposition_prompt_dict[k], expected, atol=0.1)
++
++
++def test_superposition_prompt_extend(preamble_context_query_and_task_input_ids):
++    (
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    ) = preamble_context_query_and_task_input_ids
++
++    (
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    ) = preamble_context_query_and_task_input_ids
++
++    forkjoin_digraphs = forkjoin_prompt_as_digraphs(
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    )
++    nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++    actual_superposition_prompt = digraph_to_superposition_prompt(
++        flattened_digraph, position_assignment_fn=_dummy_position_assignment_fn
++    )
++    extension = torch.tensor([4, 6], device=torch_device).unsqueeze(0)
++    actual_superposition_prompt_extended = actual_superposition_prompt.extend(extension)
++
++    forkjoin_digraphs_extended = forkjoin_prompt_as_digraphs(
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids=torch.cat([task_input_ids, extension], dim=-1),
++    )
++    nested_digraph_extended = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs_extended)
++    expected_digraph_extended = flatten_nested_digraph(nested_digraph_extended)
++    expected_superposition_prompt_extended = digraph_to_superposition_prompt(
++        expected_digraph_extended, position_assignment_fn=_dummy_position_assignment_fn
++    )
++    assert_equal(expected_superposition_prompt_extended, actual_superposition_prompt_extended)
++
++
++def test_superposition_prompt_general_forkjoin(preamble_context_query_and_task_input_ids):
++    (
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    ) = preamble_context_query_and_task_input_ids
++    forkjoin_digraphs = forkjoin_prompt_as_digraphs(
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    )
++    nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++
++    canoe_prompt_context_input_ids_list = [
++        torch.cat([context_input_ids, query_input_ids], dim=-1) for context_input_ids in context_input_ids_list
++    ]
++    expected_digraph, _ = _canoe_prompt_as_digraph(
++        preamble_input_ids=preamble_input_ids,
++        context_input_ids_list=canoe_prompt_context_input_ids_list,
++        task_input_ids=task_input_ids,
++    )
++    assert nx.is_isomorphic(flattened_digraph, expected_digraph)
++    assert sorted(list(flattened_digraph.nodes())) == sorted(list(expected_digraph.nodes()))
++
++    # Need to unpack since new representation uses NodePayload.
++    actual_nodes = {k: asdict(v["payload"]) for k, v in dict(flattened_digraph.nodes(data=True)).items()}
++    expected_nodes = dict(expected_digraph.nodes(data=True))
++    assert actual_nodes == expected_nodes
++    assert flattened_digraph.edges() == expected_digraph.edges()
++
++
++def test_nested_digraph_traversal():
++    vocab_size = 100
++
++    preamble_input_ids = torch.randint(size=[1, 10], high=vocab_size)
++    context_input_ids_list = [torch.randint(size=[1, 15 + i], high=vocab_size) for i in range(4)]
++    query_input_ids = torch.randint(size=[1, 12], high=vocab_size)
++    task_input_ids = torch.randint(size=[1, 10], high=vocab_size)
++
++    forkjoin_digraphs = forkjoin_prompt_as_digraphs(
++        preamble_input_ids=preamble_input_ids,
++        context_input_ids_list=context_input_ids_list,
++        query_input_ids=query_input_ids,
++        task_input_ids=task_input_ids,
++    )
++    forkjoin_nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++    forkjoin_flattened_digraph = flatten_nested_digraph(forkjoin_nested_digraph)
++
++    total_nodes = digraph_total_nodes(forkjoin_nested_digraph)
++    assert total_nodes == len(forkjoin_flattened_digraph)
++
++
++def test_nested_digraph_to_superposition_prompt():
++    vocab_size = 100
++
++    preamble_input_ids = torch.randint(size=[1, 10], high=vocab_size)
++    context_input_ids_list = [torch.randint(size=[1, 15 + i], high=vocab_size) for i in range(4)]
++    query_input_ids = torch.randint(size=[1, 12], high=vocab_size)
++    task_input_ids = torch.randint(size=[1, 10], high=vocab_size)
++
++    forkjoin_digraphs = forkjoin_prompt_as_digraphs(
++        preamble_input_ids=preamble_input_ids,
++        context_input_ids_list=context_input_ids_list,
++        query_input_ids=query_input_ids,
++        task_input_ids=task_input_ids,
++    )
++    forkjoin_nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++    forkjoin_flattened_digraph = flatten_nested_digraph(forkjoin_nested_digraph)
++    expected_superposition_prompt = digraph_to_superposition_prompt(
++        forkjoin_flattened_digraph,
++        500,
++        causal_mask_fn=compute_causal_mask_brute_force,
++        position_assignment_fn=_dummy_position_assignment_fn,
++    )
++
++    actual_superposition_prompt = digraph_to_superposition_prompt(
++        forkjoin_nested_digraph,
++        causal_mask_fn=compute_causal_mask_blockwise_recursive,
++        position_assignment_fn=_dummy_position_assignment_fn,
++        max_length=500,
++    )
++    assert_equal(
++        expected_superposition_prompt=expected_superposition_prompt,
++        actual_superposition_prompt=actual_superposition_prompt,
++    )
++
++
++def test_superposition_prompt_general_canoe(preamble_context_and_task_input_ids):
++    preamble_input_ids, context_input_ids_list, task_input_ids = preamble_context_and_task_input_ids
++    nested_digraph = canoe_prompt_as_nested_digraph(
++        preamble_input_ids,
++        context_input_ids_list,
++        task_input_ids,
++    )
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++
++    expected_digraph, _ = _canoe_prompt_as_digraph(
++        preamble_input_ids=preamble_input_ids,
++        context_input_ids_list=context_input_ids_list,
++        task_input_ids=task_input_ids,
++    )
++    assert nx.is_isomorphic(flattened_digraph, expected_digraph)
++    assert sorted(list(flattened_digraph.nodes())) == sorted(list(expected_digraph.nodes()))
++
++    # Need to unpack since new representation uses NodePayload.
++    actual_nodes = {k: asdict(v["payload"]) for k, v in dict(flattened_digraph.nodes(data=True)).items()}
++    expected_nodes = dict(expected_digraph.nodes(data=True))
++    assert actual_nodes == expected_nodes
++    assert flattened_digraph.edges() == expected_digraph.edges()
++
++
++@pytest.mark.parametrize(
++    "attenuate_fn",
++    [
++        attention_attenuate_forkjoin_branches,
++        bayesian_attenuate_forkjoin_branches,
++        random_attenuate_forkjoin_branches,
++    ],
++)
++@pytest.mark.parametrize("forkjoin_topk", [1, None])
++def test_conditional_log_likelihood_general(preamble_context_query_and_task_input_ids, attenuate_fn, forkjoin_topk):
++    (
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    ) = preamble_context_query_and_task_input_ids
++    forkjoin_digraphs = forkjoin_prompt_as_digraphs(
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    )
++    nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++
++    from transformers import AutoTokenizer
++
++    tok = AutoTokenizer.from_pretrained("bigscience/bloomz-7b1")
++
++    logits = torch.randn([1, flattened_digraph.number_of_nodes(), tok.vocab_size], device=torch_device)
++
++    superposition_prompt = digraph_to_superposition_prompt(
++        flattened_digraph,
++        max_length=flattened_digraph.number_of_nodes() + 2,
++        position_assignment_fn=_dummy_position_assignment_fn,
++    )
++
++    if attenuate_fn is None:
++        res_superposition_prompt = superposition_prompt
++    elif attenuate_fn in {bayesian_attenuate_forkjoin_branches, bayesian_attenuate_forkjoin_branches}:
++        res_superposition_prompt, _ = attenuate_fn(
++            forkjoin_digraphs,
++            superposition_prompt,
++            logits,
++            forkjoin_topk=forkjoin_topk,
++        )
++    elif attenuate_fn == attention_attenuate_forkjoin_branches:
++        seq_length = superposition_prompt.input_ids.numel()
++        all_attentions = F.softmax(torch.rand((seq_length, seq_length)), dim=-1)
++        res_superposition_prompt, _ = attenuate_fn(
++            forkjoin_digraphs,
++            all_attentions,
++            superposition_prompt,
++            forkjoin_topk=forkjoin_topk,
++        )
++    elif attenuate_fn == random_attenuate_forkjoin_branches:
++        res_superposition_prompt, _ = attenuate_fn(
++            forkjoin_digraphs,
++            superposition_prompt,
++            forkjoin_topk=forkjoin_topk,
++        )
++    else:
++        assert False
++
++    assert not torch.all(
++        res_superposition_prompt.attention_logit_biases == superposition_prompt.attention_logit_biases
++    )
++    diff_indices = (
++        res_superposition_prompt.attention_logit_biases != superposition_prompt.attention_logit_biases
++    ).nonzero()
++    # assert torch.all(diff_indices[:, 1] >= 137)
++
++
++def test_collate_position_ids(preamble_context_query_and_task_input_ids):
++    (
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    ) = preamble_context_query_and_task_input_ids
++
++    forkjoin_input_ids = ForkjoinInputIds(
++        preamble_input_ids,
++        context_input_ids_list,
++        query_input_ids,
++        task_input_ids,
++    )
++    forkjoin_digraphs = forkjoin_input_ids.to_forkjoin_digraphs()
++    nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++    superposition_prompt = digraph_to_superposition_prompt(
++        flattened_digraph,
++        max_length=flattened_digraph.number_of_nodes() + 2,
++        position_assignment_fn=_dummy_position_assignment_fn,
++    )
++    idxs = [2]
++    prefix_position_ids = prefix_position_ids_from_branch_selections(forkjoin_digraphs, superposition_prompt, idxs)
++    expected_len = sum(len(forkjoin_digraphs.context_digraphs[idx]) for idx in idxs) + len(
++        forkjoin_digraphs.preamble_digraph
++    )
++    assert prefix_position_ids.shape[-1] == expected_len
++
++    new_forkjoin_input_ids = push_branch_to_preamble(forkjoin_input_ids, idxs[0])
++    new_forkjoin_digraphs = new_forkjoin_input_ids.to_forkjoin_digraphs()
++    new_nested_digraph = forkjoin_prompt_as_nested_digraph(new_forkjoin_digraphs)
++    new_flattened_digraph = flatten_nested_digraph(new_nested_digraph)
++    new_superposition_prompt = digraph_to_superposition_prompt(
++        new_flattened_digraph,
++        max_length=flattened_digraph.number_of_nodes() + 2,
++        position_assignment_fn=_dummy_position_assignment_fn,
++    )
++
++    _pre_update_position_ids = torch.clone(new_superposition_prompt.position_ids)
++    new_superposition_prompt = update_superposition_prompt_with_position_id_range(
++        new_superposition_prompt, prefix_position_ids
++    )
++    _post_update_position_ids = torch.clone(new_superposition_prompt.position_ids)
++
++
++def test_dense_canoe_prompt(preamble_context_and_task_input_ids):
++    preamble_input_ids, context_input_ids_list, task_input_ids = preamble_context_and_task_input_ids
++    nested_digraph = dense_canoe_nested_digraph(
++        preamble_input_ids,
++        context_input_ids_list,
++        task_input_ids,
++    )
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++    superposition_prompt = digraph_to_superposition_prompt(
++        flattened_digraph, position_assignment_fn=_dummy_position_assignment_fn
++    )
++
++    from matplotlib import pyplot as plt
++
++    plt.imshow(torch.exp(superposition_prompt.attention_logit_biases.squeeze())[:300, :300].cpu().numpy())
++    plt.grid(which="major", axis="both", linestyle="-")
++
++
++def test_multi_level_digraph(preamble_context_and_task_input_ids):
++    preamble_input_ids, _, _ = preamble_context_and_task_input_ids
++    builder1 = NestedDigraphBuilder()
++    a1, _ = builder1.add_nested_node(preamble_input_ids[..., :5])
++    b1, _ = builder1.add_nested_node(preamble_input_ids[..., 5:])
++
++    builder2 = NestedDigraphBuilder()
++    builder2.inner_node_idx = builder1.inner_node_idx
++    a2, _ = builder2.add_nested_node(preamble_input_ids[..., :5])
++    b2, _ = builder2.add_nested_node(preamble_input_ids[..., 5:])
++
++    g1 = builder1.nested_digraph
++    g2 = builder2.nested_digraph
++
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(0, payload=NestedNodePayload(subgraph=g1))
++    nested_digraph.add_node(1, payload=NestedNodePayload(subgraph=g2))
++    nested_digraph.add_edge(0, 1)
++
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++
++
++def test_multi_level_heterogeneous_digraph(preamble_context_and_task_input_ids):
++    preamble_input_ids, _, _ = preamble_context_and_task_input_ids
++    g1 = phrase_as_path_digraph(preamble_input_ids[..., 5:], 0)
++
++    builder2 = NestedDigraphBuilder()
++    builder2.inner_node_idx = len(g1)
++    a2, _ = builder2.add_nested_node(preamble_input_ids[..., :5])
++    b2, _ = builder2.add_nested_node(preamble_input_ids[..., 5:])
++
++    g2 = builder2.nested_digraph
++
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(0, payload=NestedNodePayload(subgraph=g1))
++    nested_digraph.add_node(1, payload=NestedNodePayload(subgraph=g2))
++    nested_digraph.add_edge(0, 1)
++
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++
++
++def test_multi_level_heterogeneous_digraph(preamble_context_and_task_input_ids):
++    preamble_input_ids, _, _ = preamble_context_and_task_input_ids
++    g1 = phrase_as_path_digraph(preamble_input_ids[..., :5], 0)
++
++    builder2 = NestedDigraphBuilder()
++    builder2.inner_node_idx = len(g1)
++    _, a_idx1 = builder2.add_nested_node(preamble_input_ids[..., :5])
++    _, b_idx2 = builder2.add_nested_node(preamble_input_ids[..., 5:])
++    g2 = builder2.nested_digraph
++    g2.add_edge(a_idx1, b_idx2)
++
++    nested_digraph = nx.DiGraph()
++    nested_digraph.add_node(0, payload=NestedNodePayload(subgraph=g1))
++    nested_digraph.add_node(1, payload=NestedNodePayload(subgraph=g2))
++    nested_digraph.add_edge(0, 1)
++
++    # flattened_digraph = flatten_nested_digraph(nested_digraph)
++    nodes = get_digraph_nodes(nested_digraph)
++    _ = get_digraph_sources_and_sinks(nested_digraph)
++    flattened_digraph = flatten_nested_digraph(nested_digraph)
++    assert set(nodes) == set(flattened_digraph.nodes())
++
++
++def test_digraph_is_path_graph():
++    path_graph = nx.path_graph(4, create_using=nx.DiGraph)
++    assert digraph_is_path_graph(path_graph)
++
++    non_path_graph = nx.DiGraph()
++    non_path_graph.add_nodes_from([0, 1, 2, 3])
++    assert not digraph_is_path_graph(non_path_graph)
+diff --git a/tests/test_modeling_common.py b/tests/test_modeling_common.py
+index 85e693005..eb4d8e19e 100755
+--- a/tests/test_modeling_common.py
++++ b/tests/test_modeling_common.py
+@@ -120,6 +120,17 @@ if is_flax_available():
+ if is_torch_fx_available():
+     from transformers.utils.fx import symbolic_trace
+ 
++from transformers.prompting.superposition.core import (
++    digraph_is_nested,
++    digraph_to_superposition_prompt,
++    flatten_nested_digraph,
++    digraph_total_nodes,
++)
++from transformers.prompting.superposition.forkjoin import (
++    forkjoin_prompt_as_digraphs,
++    forkjoin_prompt_as_nested_digraph,
++)
++
+ 
+ def _config_zero_init(config):
+     configs_no_init = copy.deepcopy(config)
+@@ -3748,3 +3759,40 @@ def floats_tensor(shape, scale=1.0, rng=None, name=None):
+         values.append(rng.random() * scale)
+ 
+     return torch.tensor(data=values, dtype=torch.float, device=torch_device).view(shape).contiguous()
++
++
++def create_forkjoin_input_ids(vocab_size):
++    preamble_input_ids = ids_tensor([1, 10], vocab_size)
++    context_input_ids_list = [ids_tensor([1, 15 + i], vocab_size) for i in range(4)]
++    query_input_ids = ids_tensor([1, 12], vocab_size)
++    task_input_ids = ids_tensor([1, 10], vocab_size)
++    return preamble_input_ids, context_input_ids_list, query_input_ids, task_input_ids
++
++
++def create_forkjoin_prompt_with_extras(vocab_size, max_size=2048):
++    preamble_input_ids, context_input_ids_list, query_input_ids, task_input_ids = create_forkjoin_input_ids(vocab_size)
++
++    def _dummy_position_assignment_fn(digraph):
++        size = digraph_total_nodes(digraph)
++        return torch.arange(size)
++
++
++    forkjoin_digraphs = forkjoin_prompt_as_digraphs(
++        preamble_input_ids=preamble_input_ids,
++        context_input_ids_list=context_input_ids_list,
++        query_input_ids=query_input_ids,
++        task_input_ids=task_input_ids,
++    )
++    forkjoin_nested_digraph = forkjoin_prompt_as_nested_digraph(forkjoin_digraphs)
++    forkjoin_flattened_digraph = flatten_nested_digraph(forkjoin_nested_digraph)
++    assert not digraph_is_nested(forkjoin_flattened_digraph)
++    return (
++        digraph_to_superposition_prompt(forkjoin_flattened_digraph, max_size, position_assignment_fn=_dummy_position_assignment_fn).to(device=torch_device),
++        forkjoin_digraphs,
++        forkjoin_nested_digraph,
++        forkjoin_flattened_digraph,
++    )
++
++
++def create_forkjoin_prompt(vocab_size, max_size=2048):
++    return create_forkjoin_prompt_with_extras(vocab_size, max_size=max_size)[0]
+-- 
+2.39.3 (Apple Git-146)
+

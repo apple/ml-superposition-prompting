@@ -1,0 +1,28 @@
+parameters:
+  checkpoint_path: "bigscience/bigscience-small-testing"
+  # checkpoint_path: "bigscience/bloomz-7b1"
+  data_dir: "flows/musique/data/musique_ans_v1.0_dev.jsonl"
+  output_dir: "/mnt/task_wrapper/user_output/artifacts/"
+  branch_weighting_fn: 'bayesian_branch_weights'
+  max_new_tokens: 100
+  superposition_hops: 1
+  pre_filter_fn: "None"
+  forkjoin_topk: 4
+  topk_normalize: True
+  generate_temperature: 0.0
+
+
+# Other options:
+# branch_weighting_fn:
+# - 'bayesian_branch_weights'
+# - 'attention_branch_weights'
+# checkpoint_path:
+# - 'bigscience/bloomz-1b7'
+# - 'bigscience/bloomz-3b'
+# - 'bigscience/bloomz-7b1'
+# - 'mosaicml/mpt-7b-instruct'
+# forkjoin_topk:
+# - 2
+# - 4
+# - 8
+# - 16

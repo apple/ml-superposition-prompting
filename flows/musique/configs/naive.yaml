@@ -1,0 +1,21 @@
+parameters:
+  checkpoint_path: "bigscience/bloomz-1b7"
+  data_dir: "flows/musique/data/musique_ans_v1.0_dev.jsonl"
+  output_dir: "/mnt/task_wrapper/user_output/artifacts/"
+  pre_filter_fn: None
+  branch_weighting_fn: None
+  max_new_tokens: 100
+  superposition_hops: 0
+  superposition_flattening: 20
+  generate_temperature: 0.0
+  format_alpaca: False
+  format_llama: True
+  preamble_str: "You are a question-answering assistant, who is careful to reference source material. Use the source(s) below to answer the user question. Reply succinctly with just the answer phrase (not complete sentences), without punctuation or explanation. For example, 'Answer: Boeing', or 'Answer: Redwood National and State Parks'.\n\n"
+  task_str: " Remember, answer with only the phrase (no explanation or full sentences)."
+
+# Other options:
+# checkpoint_path:
+# - 'bigscience/bloomz-1b7'
+# - 'bigscience/bloomz-3b'
+# - 'bigscience/bloomz-7b1'
+# - 'mosaicml/mpt-7b-instruct'

@@ -1,0 +1,6 @@
+[submodule "third_party/StonyBrookNLP/musique"]
+	path = third_party/StonyBrookNLP/musique
+	url = https://github.com/StonyBrookNLP/musique.git
+[submodule "third_party/huggingface/transformers"]
+	path = third_party/huggingface/transformers
+	url = https://github.com/huggingface/transformers.git
